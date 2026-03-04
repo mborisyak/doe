@@ -39,7 +39,7 @@ class ODEModel(Generic[Parameters]):
       return self.rhs(state, condition, parameters)
 
     self.term = diffrax.ODETerm(rhs)
-    self.solver = diffrax.Dopri5()
+    self.solver = diffrax.Tsit5()
 
   def initial_state(self, conditions: Conditions) -> jax.Array:
     """
@@ -60,9 +60,12 @@ class ODEModel(Generic[Parameters]):
   def trajectory(self, conditions, timestamps, parameters):
     result = diffrax.diffeqsolve(
       self.term, self.solver,
-      dt0=1.0e-2, t0=0, t1=TIME_HORIZON, saveat=diffrax.SaveAt(ts=timestamps),
+      dt0=0.1, t0=0, t1=TIME_HORIZON, saveat=diffrax.SaveAt(ts=timestamps),
       y0=self.initial_state(conditions),
-      args=(conditions, parameters)
+      args=(conditions, parameters),
+      stepsize_controller=diffrax.ConstantStepSize(),
+      max_steps=int(TIME_HORIZON / 0.1) + 1,
+      adjoint=diffrax.DirectAdjoint(),
     )
 
     return result.ys

@@ -1,0 +1,37 @@
+04 March 2026
+=========================
+
+doe/common/common.py
+- ODE solver switched from Dopri5 to Tsit5
+- Step size changed from 1e-2 to 0.1
+- Added explicit ConstantStepSize() controller, max_steps, and DirectAdjoint()
+  needed for compatibility with jacfwd through the ODE solve
+
+doe/doe/fisher.py (complete rewrite)
+- Takes an ODEModel directly (no neural network surrogate)
+- Takes timestamps: jax.Array instead of t0/t1/n_timestamps (fixed measurement grid)
+- Parameters passed to propose() in natural space and encoded internally
+- Encoding/decoding of conditions and parameters via logit/sigmoid transforms
+- Jacobian computed with jacfwd (forward-mode over reverse-mode) for
+  compatibility with DirectAdjoint
+- Line search extracted into ArmijoLineSearch; Fisher accepts one as
+  line_search= or defaults to ArmijoLineSearch(x_min=-3, x_max=3)
+- _propose uses jax.lax.scan with value_and_grad + line_search.update per iteration
+
+doe/doe/line_search.py (new file)
+- ArmijoLineSearch: backtracking line search following the optax
+  GradientTransformation interface (init / update)
+- init(params) returns an ArmijoState (currently stateless)
+- update(grads, state, params, *, value_fn, value=None) runs the Armijo
+  while-loop and returns (updates, new_state), compatible with optax.apply_updates
+- Optional box projection via x_min / x_max
+
+doe/doe/__init__.py
+- Now exports Fisher, ArmijoLineSearch, ArmijoState
+
+tests/test_fisher.py (new file)
+- Defines SimpleEnzyme (Michaelis-Menten kinetics, 3-state ODE)
+- Runs MLE parameter estimation, then calls fisher.propose with n=3 to get
+  a batch of 3 jointly-optimised experimental conditions
+- Asserts shape (3, n_cond) and finiteness
+- Plots loss trace + bar charts for all 3 proposed conditions

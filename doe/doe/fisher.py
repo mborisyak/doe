@@ -1,262 +1,151 @@
-from functools import partial
-
-import numpy as np
 import jax
 import jax.numpy as jnp
+
+from ..common import ODEModel
+from .line_search import ArmijoLineSearch
 
 __all__ = [
   'Fisher'
 ]
 
-class FisherBase(object):
+
+class Fisher:
   EIGENVALUE_THRESHOLD = 1.0
-  ITERATIONS = 2048
 
   def __init__(
-      self, sampler, estimate, estimate_raw, regressor_parameters, regressor_state, optimizer,
-      horizon: int, iterations: int, regularization: float | None=None, criterion: str='D'
+      self, model: ODEModel, condition_ranges, parameter_ranges,
+      timestamps: jax.Array,
+      iterations: int, regularization: float | None = None, criterion: str = 'D',
+      line_search: ArmijoLineSearch | None = None,
   ):
-    super().__init__(horizon=horizon)
+    self.model = model
+    self.condition_ranges = condition_ranges
+    self.parameter_ranges = parameter_ranges
 
-    self.regressor_parameters = regressor_parameters
-    self.regressor_state = regressor_state
-    self.optimizer = optimizer
+    def decode_ranges(encoded, ranges):
+      return type(ranges)(*(
+        jax.nn.sigmoid(encoded[j]) * (high - low) + low
+        for j, (low, high) in enumerate(ranges)
+      ))
+
+    def encode_ranges(values, ranges):
+      return jnp.stack([
+        jax.scipy.special.logit(jnp.clip((v - low) / (high - low), 1e-6, 1 - 1e-6))
+        for v, (low, high) in zip(values, ranges)
+      ])
 
     @jax.jit
-    def jacobian(controls, ts, latent, reg_parameters, reg_state):
+    def estimate_raw(cond_encoded, ts, params_encoded):
+      cond = decode_ranges(cond_encoded, condition_ranges)
+      params = decode_ranges(params_encoded, parameter_ranges)
+      return model.solve(cond, ts, params).ravel()
+
+    @jax.jit
+    def jacobian(controls, ts, encoded_parameters):
+      # controls: (n_e, n_cond), ts: (n_e, n_t), encoded_parameters: (n_params,)
+      # output:   (n_e, n_t*n_obs, n_params)
+      # jacfwd is used so the inner Jacobian (w.r.t. params) is computed via
+      # forward-mode AD, which is composable with the outer reverse-mode gradient
+      # (w.r.t. controls). Reverse-over-reverse through an adaptive ODE while_loop
+      # is not supported by JAX/diffrax.
       return jax.vmap(
-        jax.vmap(
-          jax.jacobian(estimate_raw, argnums=2),
-          in_axes=(0, 0, None, None, None),
-          out_axes=0
-        ),
-        in_axes=(0, 0, 0, None, None),
-        out_axes=0
-      )(controls, ts, latent, reg_parameters, reg_state)
+        jax.jacfwd(estimate_raw, argnums=2),
+        in_axes=(0, 0, None),
+        out_axes=0,
+      )(controls, ts, encoded_parameters)
 
     @jax.jit
-    def information(controls, ts, latent, reg_parameters, reg_state, mask=None):
-      J = jacobian(controls, ts, latent, reg_parameters, reg_state)
-      I = jax.lax.dot_general(J, J, (([2, ], [2, ]), ([0, 1], [0, 1])))
-      if mask is None:
-        return jnp.sum(I, axis=1)
-      else:
-        return jnp.sum(I * mask[:, :, None, None], axis=(1, ))
+    def information(controls, ts, encoded_parameters):
+      J = jacobian(controls, ts, encoded_parameters)
+      # J: (n_e, n_t*n_obs, n_params); contract over obs axis, batch over n_e
+      I = jax.lax.dot_general(J, J, (([1], [1]), ([0], [0])))
+      # I: (n_e, n_params, n_params); sum over experiments
+      return jnp.sum(I, axis=0)
 
     if criterion == 'D':
       @jax.jit
-      def criterion(I):
+      def criterion_fn(I):
         svdvals = jnp.linalg.svdvals(I)
         return -2 * jnp.sum(jnp.log(svdvals))
     elif criterion == 'A':
       @jax.jit
-      def criterion(I):
+      def criterion_fn(I):
         svdvals = jnp.linalg.svdvals(I)
-        eignvals_inv = jnp.square(1 / svdvals)
-        return jnp.sum(eignvals_inv)
+        return jnp.sum(jnp.square(1 / svdvals))
     else:
       raise ValueError('criterion must be either A or D.')
 
     @jax.jit
-    def loss(controls, ts, latent, I0, reg_parameters, reg_state):
-      n_b, n_e, *_ = controls.shape
-      I = information(controls, ts, latent, reg_parameters, reg_state)
-      l = criterion(I + I0)
-
+    def loss(controls, ts, encoded_parameters, I0):
+      I = information(controls, ts, encoded_parameters)
+      l = criterion_fn(I + I0)
       if regularization is None:
         return l
       else:
-        reg = jnp.sum(jnp.square(controls))
-        return l + regularization * reg
+        return l + regularization * jnp.sum(jnp.square(controls))
+
+    if line_search is None:
+      line_search = ArmijoLineSearch(x_min=-3.0, x_max=3.0)
 
     @jax.jit
-    def grad_loss(controls, ts, latent, I0, reg_parameters, reg_state):
-      return jax.value_and_grad(loss, argnums=0)(controls, ts, latent, I0, reg_parameters, reg_state)
+    def _propose(initial, encoded_parameters, I0):
+      n_e, _ = initial.shape
+      ts = jnp.broadcast_to(timestamps[None], (n_e, timestamps.shape[0]))
+      opt_state = line_search.init(initial)
 
-    def loss2(controls, ts, latent, I0, reg_parameters, reg_state):
-      *_, n_e, n_t = ts.shape
-      controls = controls.reshape((1, n_e, -1))
-      l = loss(controls, ts, latent, I0, reg_parameters, reg_state)
-      return np.array(l)
+      def value_fn(proposal):
+        return loss(proposal, ts, encoded_parameters, I0)
 
-    def grad_loss2(controls, ts, latent, I0, reg_parameters, reg_states):
-      *_, n_e, n_t = ts.shape
-      controls = controls.reshape((1, n_e, -1))
-      l, grad = grad_loss(controls, ts, latent, I0, reg_parameters, reg_states)
-      return np.array(l, dtype=np.float64), np.array(grad, dtype=np.float64).ravel()
+      def _step(carry, _):
+        proposal, state = carry
+        value, grads = jax.value_and_grad(value_fn)(proposal)
+        updates, new_state = line_search.update(grads, state, proposal, value_fn=value_fn, value=value)
+        return (proposal + updates, new_state), value
 
-    @jax.jit
-    def step(controls, ts, latent, opt_state, I0, reg_parameters, reg_state):
-      l, grad = grad_loss(controls, ts, latent, I0, reg_parameters, reg_state)
-      updates, opt_state_updated = self.optimizer.update(
-        grad, opt_state, controls,
-        value=l, grad=grad, value_fn=loss, ts=ts, latent=latent,
-        reg_parameters=reg_parameters, reg_state=reg_state
-      )
-      controls_updated = optax.apply_updates(controls, updates)
-
-      return l, controls_updated, opt_state_updated
-
-    @partial(jax.jit, static_argnums=(1, 2))
-    def sample_time(key, n_b, n_e):
-      ts = sampler.hyper.timestamps.sample(key, sampler.hyper_condition.timestamps, shape=(n_b, n_e))
-      return sampler.hyper.timestamps.encode(ts, sampler.hyper_condition.timestamps)
-
-    @jax.jit
-    def propose(key, initial, latent, I0, reg_parameters, reg_state):
-      n_b, n_e, _ = initial.shape
-
-      def step(carry, _):
-        k, proposal, opt_state = carry
-
-        k, k_ts = jax.random.split(k, num=2)
-        ts = self.sample_time(k_ts, n_b, n_e)
-        l, proposal_updated, opt_state_updated = self.step(
-          proposal, ts, latent, opt_state, I0, reg_parameters, reg_state
-        )
-        proposal_updated = jnp.clip(proposal_updated, -3, 3)
-
-        return (k, proposal_updated, opt_state_updated), l
-
-      (_, proposed, _), losses = jax.lax.scan(
-        step, init=(key, initial, self.optimizer.init(initial)), length=iterations
+      (proposed, _), losses = jax.lax.scan(
+        _step, init=(initial, opt_state), length=iterations
       )
       return losses, proposed
 
-    def propose_iter(key, initial, latent, reg_parameters, reg_states):
-      n_b, n_e, _ = initial.shape
+    self._encode_ranges = encode_ranges
+    self._decode_ranges = decode_ranges
+    self.jacobian = jacobian
+    self.information = information
+    self.loss = loss
+    self.line_search = line_search
+    self._propose = _propose
 
-      key, k_ts = jax.random.split(key, num=2)
-      ts = self.sample_time(k_ts, n_b, n_e)
+  def encode_conditions(self, conditions):
+    return self._encode_ranges(conditions, self.condition_ranges)
 
-      proposal = initial
-      opt_state = self.optimizer.init(initial)
-      losses = np.zeros(shape=(iterations, ))
-      for i in range(iterations):
-        losses[i], proposal, opt_state = step(
-          proposal, ts, latent, opt_state, reg_parameters, reg_states
-        )
-        assert np.all(np.isfinite(ts))
-        assert np.all(np.isfinite(proposal)), f'iter {i}'
+  def decode_conditions(self, encoded):
+    return self._decode_ranges(encoded, self.condition_ranges)
 
-      return losses, proposal
+  def encode_parameters(self, parameters):
+    return self._encode_ranges(parameters, self.parameter_ranges)
 
-    def propose_scipy(key, initial, latent, I0, reg_parameters, reg_state):
-      from scipy import optimize as opt
-      n_b, n_e, n_c = initial.shape
+  def decode_parameters(self, encoded):
+    return self._decode_ranges(encoded, self.parameter_ranges)
 
-      proposed = np.ndarray(shape=initial.shape)
-      losses = np.ndarray(shape=(n_b, ))
-      for i in range(n_b):
-        key, key_ts = jax.random.split(key, num=2)
-        ts = self.sample_time(key_ts, 1, n_e)
-        sol = opt.minimize(
-          grad_loss2, np.clip(np.array(initial[i:(i + 1)]).ravel(), -3, 3),
-          args=(ts, latent[i:(i + 1)], I0, reg_parameters, reg_state), method='L-BFGS-B',
-          bounds=[(-3, 3) for _ in range(n_e * n_c)], jac=True, options={'max_iter': iterations}
-        )
-        proposed[i] = sol.x.reshape(initial.shape[1:])
-        if not sol.success:
-          print(sol)
-        losses[i] = sol.fun
+  def propose(self, key, n, controls, timestamps, parameters):
+    """
+    Propose n new experimental conditions.
 
-      return losses, proposed
+    key:        JAX PRNG key
+    n:          number of new experiments to propose
+    controls:   (n_e, n_cond) encoded past conditions
+    timestamps: (n_e, n_t)   past measurement timestamps
+    parameters: (n_params,)  parameter estimate in natural space
 
-    self._estimate = lambda controls, ts, latent: estimate(
-      controls, ts, latent, reg_parameters=self.regressor_parameters, reg_state=self.regressor_state
-    )
-
-    self.jacobian = lambda controls, ts, latent: jacobian(
-      controls, ts, latent, reg_parameters=self.regressor_parameters, reg_state=self.regressor_state
-    )
-
-    self.information = lambda controls, ts, latent, mask=None: information(
-      controls, ts, latent, reg_parameters=self.regressor_parameters, reg_state=self.regressor_state, mask=mask
-    )
-    self.loss = lambda controls, ts, latent: loss(
-      controls, ts, latent, reg_parameters=self.regressor_parameters, reg_state=self.regressor_state
-    )
-    self.step = step
-    self.sample_time = sample_time
-    # self._propose = lambda key, initial, latent: propose(
-    #   key, initial, latent, self.inference_parameters, self.inference_state
-    # )
-    self._propose = lambda key, initial, latent, I0: propose(
-      key, initial, latent, I0, reg_parameters=self.regressor_parameters, reg_state=self.regressor_state
-    )
-
-    self.loss2 = lambda controls, ts, latent, I0: loss2(
-      controls, ts, latent, I0, self.regressor_parameters, self.regressor_state
-    )
-
-  def infer(self, controls, timestamps, observations, mask=None):
-    raise NotImplementedError()
-
-  def propose(self, key, n, controls, timestamps, observations, mask: jax.Array | None=None):
-    latent = self.infer(controls, timestamps, observations, mask=mask)
-    I0 = self.information(controls, timestamps, latent, mask=mask)
-    n_b, m1, m2 = I0.shape
-    assert m1 == m2, f'{I0.shape}'
+    Returns: (iterations,) loss trace, (n, n_cond) proposed encoded conditions
+    """
+    encoded_parameters = self.encode_parameters(parameters)
+    I0 = self.information(controls, timestamps, encoded_parameters)
+    m1, m2 = I0.shape
+    assert m1 == m2
     I0 = I0 + self.EIGENVALUE_THRESHOLD * jnp.eye(m1)
 
-    assert jnp.all(jnp.isfinite(latent))
-    n_b, _, n_c = controls.shape
-    key, key_initial = jax.random.split(key, num=2)
-
-    initial = jax.random.normal(key_initial, shape=(n_b, n, n_c))
-    return self._propose(key, initial=initial, latent=latent, I0=I0)
-
-  def estimate(
-      self, key: jax.Array, n: int,
-      controls_history: jax.Array, timestamps_history: jax.Array, observations_history: jax.Array,
-      controls: jax.Array, timestamps: jax.Array, mask: jax.Array | None=None
-  ) -> jax.Array:
-    latent = self.infer(
-      controls_history, timestamps_history, observations_history,
-      mask=mask
-    )
-    estimations = self._estimate(controls, timestamps, latent)
-    n_b, n_e, n_t, n_obs = estimations.shape
-
-    return jnp.broadcast_to(estimations[:, None, :, :, :], shape=(n_b, n, n_e, n_t, n_obs))
-
-class Fisher(FisherBase):
-  def __init__(
-      self, inference, regressor, horizon: int, iterations: int, optimizer,
-      regularization: float | None=None, criterion='D'
-  ):
-    _, self.inference_def, self.inference_parameters, self.inference_state = io.restore_model(
-      inference, checkpoint=inference['checkpoint']
-    )
-
-    sampler, self.regressor_def, self.regressor_parameters, self.regressor_state = io.restore_model(
-      regressor, checkpoint=regressor['checkpoint']
-    )
-
-    @jax.jit
-    def infer(controls, ts, obs, mask, inf_parameters, inf_state):
-      model = nnx.merge(self.inference_def, inf_parameters, inf_state)
-      return model.infer(controls, ts, obs, mask, deterministic=True)
-
-    @jax.jit
-    def estimate(controls, ts, latent, reg_parameters, reg_state):
-      model = nnx.merge(self.regressor_def, reg_parameters, reg_state)
-      return model(controls, latent, ts, deterministic=True)
-
-    @jax.jit
-    def estimate_raw(controls, ts, latent, reg_parameters, reg_state):
-      model = nnx.merge(self.regressor_def, reg_parameters, reg_state)
-      X = jnp.concatenate([controls, latent, ts], axis=-1)
-      return model.regressor(X, deterministic=True)
-
-    self._infer = infer
-
-    super().__init__(
-      sampler, estimate, estimate_raw, self.regressor_parameters, self.regressor_state,
-      optimizer=optimizer_from_config(optimizer),
-      horizon=horizon, iterations=iterations, regularization=regularization,
-      criterion=criterion
-    )
-
-  def infer(self, controls, timestamps, observations, mask=None):
-    return self._infer(controls, timestamps, observations, mask, self.inference_parameters, self.inference_state)
+    _, n_c = controls.shape
+    key, key_initial = jax.random.split(key)
+    initial = 1.0e-3 * jax.random.normal(key_initial, shape=(n, n_c))
+    return self._propose(initial=initial, encoded_parameters=encoded_parameters, I0=I0)
