@@ -38,8 +38,56 @@ def compile_cse(inputs, replacements, outputs):
 
 CONDITIONS = ['A0', 'B0', 'E0', 'T']
 
+
+def validate_spec(spec):
+  groups = {
+    'states': set(spec['states']),
+    'parameters': set(spec['parameters']),
+    'algebraics': set(spec.get('algebraics', {})),
+  }
+  pairs = [
+    ('states', 'parameters'),
+    ('states', 'algebraics'),
+    ('parameters', 'algebraics'),
+  ]
+  for name_a, name_b in pairs:
+    overlap = groups[name_a] & groups[name_b]
+    if overlap:
+      raise ValueError(f"Variable name conflict between '{name_a}' and '{name_b}': {sorted(overlap)}")
+
+
 class CustomODESystem(ODEModel):
+  """
+  Converts serializable description of a system into an instance of ODEModel.
+
+  spec is a dictionary with the following fields:
+  - states: model fields, a list of strings;
+  - parameters: model parameters with their ranges, a dictionary with parameter names as keys and
+    a 2-element sequence of floats (lower, upper) as value.
+  - initial_state: defines initial_state method, a dictionary: state name -> expression;
+    The expression can use predefined condition variables: A0, B0, E0, T (temperature).
+  - algebraics: a dictionary with definitions of temporary variables (algebraics) for rhs,
+    variable name -> expression. The expressions can use previously defined variables, states, initial condition variables and parameters.
+  - rhs: a dictionary with definitions of states' time derivatives, state name -> expression,
+    the expressions can use algebraic variables (defined by "algebraics"), states, initial condition variables and parameters.
+    Expressions in "rhs" can't use other time derivatives, algebraics can be used instead:
+        "algebraics": {
+          "rate": <expression>
+        },
+        "rhs": {
+          "A": "-rate",
+          "B": "-rate",
+        }
+  - observables: a dictionary with definitions of observables (currently only "A"). The expressions in "observables"
+      can use state variables and parameter values. Often definitions are trivial, e.g.:
+        "observables": {
+          "A": "A"
+        }
+      assigns observable "A" the value of state "A".
+  """
   def __init__(self, spec):
+    validate_spec(spec)
+
     self.states = spec['states']
     self.parameters = spec['parameters']
 
@@ -109,7 +157,7 @@ class CustomODESystem(ODEModel):
     initial_state = self._initial_compiled(Ac, Bc, Ec, conditions.temperature)
     return jnp.stack(initial_state, axis=-1)
 
-  def observables(self, state):
+  def observables(self, state, parameters):
     named_states = [state[..., i] for i, _ in enumerate(self.states)]
     obs = self._observables_compiled(*named_states)
     return obs

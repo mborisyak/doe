@@ -11,17 +11,17 @@ from doe.common import Conditions
 
 
 def test_custom_ode(plot_root, seed):
-  root = os.path.dirname(__file__)
+  root = os.path.dirname(os.path.dirname(__file__))
 
-  with open(os.path.join(root, 'simple.json'), 'r') as f:
+  with open(os.path.join(root, 'data', 'models', 'simple.json'), 'r') as f:
     spec = json.load(f)
 
   model = doe.common.CustomODESystem(spec)
 
-  with open(os.path.join(root, 'example.json'), 'r') as f:
+  with open(os.path.join(root, 'data', 'experiments', 'example.json'), 'r') as f:
     conditions_data = json.load(f)
 
-  with open(os.path.join(root, 'measurements.json'), 'r') as f:
+  with open(os.path.join(root, 'data', 'experiments', 'measurements.json'), 'r') as f:
     measurements_data = json.load(f)
 
   labels = [k for k in conditions_data]

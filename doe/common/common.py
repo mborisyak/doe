@@ -54,7 +54,7 @@ class ODEModel(Generic[Parameters]):
   def rhs(self, state: jax.Array, conditions: Conditions, parameters: Parameters) -> jax.Array:
     raise NotImplementedError()
 
-  def observables(self, state: jax.Array) -> jax.Array:
+  def observables(self, state: jax.Array, parameters: Parameters) -> jax.Array:
     raise NotImplementedError()
 
   def trajectory(self, conditions, timestamps, parameters):
@@ -72,7 +72,7 @@ class ODEModel(Generic[Parameters]):
 
   def solve(self, conditions, timestamps, parameters):
     states = self.trajectory(conditions, timestamps, parameters)
-    return self.observables(states)
+    return self.observables(states, parameters)
 
   def parameter_ranges(self) -> Parameters:
     raise NotImplementedError()
