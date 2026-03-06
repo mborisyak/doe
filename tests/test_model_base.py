@@ -25,7 +25,7 @@ class SimpleEnzyme(doe.common.ODEModel[Parameters]):
 
     return jnp.stack([-rate, -rate, jnp.zeros_like(rate)], axis=-1)
 
-  def observe(self, state: jax.Array) -> jax.Array:
+  def observables(self, state: jax.Array) -> jax.Array:
     return state[..., 0]
 
 def test_base_model(plot_root):

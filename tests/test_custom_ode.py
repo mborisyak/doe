@@ -9,24 +9,14 @@ import matplotlib.pyplot as plt
 import doe
 from doe.common import Conditions
 
-Parameters = namedtuple('Parameters', ['q', 'K_A', 'K_B'])
 
-class SimpleEnzyme(doe.common.ODEModel[Parameters]):
-  def initial_state(self, conditions: Conditions) -> jax.Array:
-    Ac, Bc, Ec = doe.common.get_initial_concentrations(conditions)
-    return jnp.stack([Ac, Bc, Ec], axis=-1)
-
-  def rhs(self, state: jax.Array, conditions: Conditions, parameters: Parameters) -> jax.Array:
-    A, B, E = state[..., 0], state[..., 1], state[..., 2]
-    rate = E * parameters.q * A / (parameters.K_A + A) * B / (B + parameters.K_B)
-    return jnp.stack([-rate, -rate, jnp.zeros_like(rate)], axis=-1)
-
-  def observables(self, state: jax.Array) -> jax.Array:
-    return state[..., 0]
-
-
-def test_fisher(plot_root, seed):
+def test_custom_ode(plot_root, seed):
   root = os.path.dirname(__file__)
+
+  with open(os.path.join(root, 'simple.json'), 'r') as f:
+    spec = json.load(f)
+
+  model = doe.common.CustomODESystem(spec)
 
   with open(os.path.join(root, 'example.json'), 'r') as f:
     conditions_data = json.load(f)
@@ -40,9 +30,20 @@ def test_fisher(plot_root, seed):
   conditions_data = {k: conditions_data[k] for k in selection}
   measurements_data = {k: measurements_data[k] for k in selection}
 
-  model = SimpleEnzyme()
-  parameter_ranges = Parameters(q=[1.0e+2, 2.0e+3], K_A=[1.0e-2, 2.0], K_B=[1.0e-2, 2.0])
+  parameter_ranges = model.parameter_ranges()
   condition_ranges = Conditions(A=[0.1, 5.0], B=[0.1, 5.0], E=[0.1, 5.0], temperature=[0.0, 100.0])
+
+  parameters = model.Parameters(q=1.0e+3, K_A=1.0, K_B=1.0)
+  conditions = doe.common.Conditions(A=2.0, B=2.0, E=2.0, temperature=37.0)
+
+  state = model.initial_state(conditions)
+  print(state)
+
+  ds_dt = model.rhs(state, conditions, parameters)
+  print(ds_dt)
+  assert jnp.allclose(ds_dt, jnp.array([-0.25, -0.25, 0.0]))
+
+  trajectory = model.solve(conditions, jnp.linspace(0, 1, num=10), parameters)
 
   # estimate parameters from existing data
   _, parameters, _ = doe.inference.maximum_likelihood_estimate(
