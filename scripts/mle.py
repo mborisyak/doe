@@ -13,6 +13,12 @@ Arguments:
                  (dict: label -> {A, B, E, temperature}).
   --data         Path to JSON file with measurements
                  (dict: label -> {timestamps: [...], measurements: [...]}).
+  --initial      Optional JSON file with initial parameter values.
+                 Accepted forms:
+                   {"q": ..., "K_A": ..., "K_B": ...}
+                 or
+                   {"parameters": {"q": ..., "K_A": ..., "K_B": ...}}
+  --dtype        Numeric dtype: float32 or float64 (default: float32).
   --iterations   Max optimiser iterations (default: 1024).
   --rtol         Relative tolerance for early stopping (default: 1e-6).
                  Pass 0 to disable early stopping.
@@ -41,6 +47,10 @@ def parse_args():
                  help='JSON file with experimental conditions.')
   p.add_argument('--data', required=True, metavar='FILE',
                  help='JSON file with timestamps and measurements per experiment.')
+  p.add_argument('--initial', metavar='FILE', default=None,
+                 help='Optional JSON file with initial parameter values.')
+  p.add_argument('--dtype', choices=('float32', 'float64'), default='float32',
+                 help='Numeric dtype for optimisation (default: float32).')
   p.add_argument('--iterations', type=int, default=1024, metavar='N',
                  help='Maximum number of optimiser iterations (default: 1024).')
   p.add_argument('--rtol', type=float, default=1e-6, metavar='TOL',
@@ -78,14 +88,45 @@ def main():
 
   model = CustomODESystem(spec)
   parameter_ranges = model.parameter_ranges()
+  dtype = jnp.float64 if args.dtype == 'float64' else jnp.float32
 
   rtol = args.rtol if args.rtol != 0.0 else None
+
+  initial = None
+  if args.initial is not None:
+    with open(args.initial) as f:
+      initial_payload = json.load(f)
+
+    if isinstance(initial_payload, dict) and 'parameters' in initial_payload:
+      initial_payload = initial_payload['parameters']
+
+    if not isinstance(initial_payload, dict):
+      print('error: --initial must be a JSON object or contain top-level "parameters" object', file=sys.stderr)
+      sys.exit(1)
+
+    expected = set(model.parameters.keys())
+    provided = set(initial_payload.keys())
+    missing = sorted(expected - provided)
+    extra = sorted(provided - expected)
+    if missing:
+      print(f'error: initial parameter file is missing required keys: {missing}', file=sys.stderr)
+      sys.exit(1)
+    if extra:
+      print(f'error: initial parameter file has unexpected keys: {extra}', file=sys.stderr)
+      sys.exit(1)
+
+    initial = model.Parameters(**{
+      name: float(initial_payload[name])
+      for name in model.parameters
+    })
 
   losses, parameters, predictions = maximum_likelihood_estimate(
     model, conditions, data,
     parameter_ranges=parameter_ranges,
+    initial=initial,
     iterations=args.iterations,
     rtol=rtol,
+    dtype=dtype,
   )
 
   residuals = {}
@@ -95,6 +136,7 @@ def main():
 
   result = {
     'parameters': {name: float(getattr(parameters, name)) for name in model.parameters},
+    'loss_trace': [float(v) for v in losses],
     'loss': float(losses[-1]),
     'iterations': int(len(losses)),
     'predictions': {label: [float(v) for v in pred] for label, pred in predictions.items()},

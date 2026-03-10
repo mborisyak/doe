@@ -1,0 +1,15 @@
+{
+  "experiment 1": {
+    "A": 1.0,
+    "B": 2.0,
+    "E": 1.0,
+    "temperature": 10.0
+  },
+  "experiment 2": {
+    "A": 1.0,
+    "B": 1.2,
+    "E": 1.0,
+    "temperature": 50.0
+  }
+}
+

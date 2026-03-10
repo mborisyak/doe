@@ -1,0 +1,24 @@
+{
+  "states": ["A", "B", "E"],
+  "parameters": {
+    "q": [100.0, 2000.0],
+    "K_A": [0.01, 2.0],
+    "K_B": [0.01, 2.0]
+  },
+  "initial_state": {
+    "A": "A0",
+    "B": "B0",
+    "E": "E0"
+  },
+  "algebraics": {
+    "rate": "E * q * A / (K_A + A) * B / (K_B + B)"
+  },
+  "rhs": {
+    "A": "-rate",
+    "B": "-rate",
+    "E": "0"
+  },
+  "observables": {
+    "A": "A"
+  }
+}

@@ -25,17 +25,17 @@ class SimpleEnzyme(doe.common.ODEModel[Parameters]):
 
     return jnp.stack([-rate, -rate, jnp.zeros_like(rate)], axis=-1)
 
-  def observables(self, state: jax.Array) -> jax.Array:
+  def observables(self, state: jax.Array, parameters: Parameters) -> jax.Array:
     return state[..., 0]
 
 def test_base_model(plot_root):
-  root = os.path.dirname(__file__)
+  root = os.path.dirname(os.path.dirname(__file__))
 
-  with open(os.path.join(root, 'example.json'), 'r') as f:
+  with open(os.path.join(root, 'data', 'experiments', 'example.json'), 'r') as f:
     import json
     conditions = json.load(f)
 
-  with open(os.path.join(root, 'measurements.json'), 'r') as f:
+  with open(os.path.join(root, 'data', 'experiments', 'measurements.json'), 'r') as f:
     import json
     measurements = json.load(f)
 
