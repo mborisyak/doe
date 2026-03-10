@@ -189,7 +189,6 @@ The engine validates `model_spec` with DOE `CustomODESystem`, then delegates hea
 4. `mcp_engine.py`
    - orchestration + subprocess execution of `scripts/mle.py` and `scripts/new_exp.py`
    - output parsing and response shaping
-   - metadata construction
    - numeric sanity checks
 5. `mcp_errors.py`
    - envelope helpers (`success_response`, `error_response`)
@@ -329,24 +328,6 @@ Fits model parameters from historical data using `doe.inference.maximum_likeliho
   "predictions": {
     "experiment 1": [0.54, 0.40, 0.32],
     "experiment 2": [0.55, 0.34, 0.24]
-  },
-  "metadata": {
-    "model_identifier": "enzyme_model_from_dict_v1",
-    "model_version": "1.0.0",
-    "solver": {
-      "id": "optax.lbfgs",
-      "configuration": {"iterations": 64, "rtol": 1e-6, "dtype": "float32"}
-    },
-    "units_map": {
-      "time": "s",
-      "temperature": "C",
-      "solution_volume": "mL",
-      "concentration": "mM"
-    },
-    "warnings": [],
-    "diagnostics": {"num_experiments": 2, "num_timestamps": {"experiment 1": 3, "experiment 2": 3}},
-    "deterministic": true,
-    "seed": null
   }
 }
 ```
@@ -425,25 +406,7 @@ Params for `model_spec` are extracted from `data/models/simple.json` in (https:/
     [0.22, 1.4, -0.5, 0.71],
     [-1.31, 0.88, 0.09, -0.96]
   ],
-  "loss_trace": [12.8, 10.1, 8.3],
-  "metadata": {
-    "model_identifier": "enzyme_model_from_dict_v1",
-    "model_version": "1.0.0",
-    "solver": {
-      "id": "fisher.armijo",
-      "configuration": {"criterion": "D", "iterations": 64, "regularization": null}
-    },
-    "units_map": {
-      "time": "s",
-      "temperature": "C",
-      "solution_volume": "mL",
-      "concentration": "mM"
-    },
-    "warnings": [],
-    "diagnostics": {"history_experiments": 2, "proposal_count": 2},
-    "deterministic": true,
-    "seed": 12345
-  }
+  "loss_trace": [12.8, 10.1, 8.3]
 }
 ```
 
@@ -532,7 +495,7 @@ Error:
 
 - `fit_parameters` is deterministic for fixed inputs.
 - `propose_doe_experiments` is deterministic for fixed request + `proposal_config.seed`.
-- seed is required for proposal flow and echoed in response metadata.
+- seed is required for proposal flow.
 
 ## Validation Rules
 

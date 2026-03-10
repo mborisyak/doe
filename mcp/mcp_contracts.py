@@ -8,17 +8,8 @@ try:
 except ImportError:  # pragma: no cover
     from pydantic import BaseModel, Field, root_validator, validator
 
-DYNAMIC_MODEL_IDENTIFIER = "enzyme_model_from_dict_v1"
-
 REQUIRED_PARAMETER_NAMES: Tuple[str, ...] = ("q", "K_A", "K_B")
 REQUIRED_CONDITION_NAMES: Tuple[str, ...] = ("A", "B", "E", "temperature")
-
-DEFAULT_UNITS_MAP: Dict[str, str] = {
-    "time": "s",
-    "temperature": "C",
-    "solution_volume": "mL",
-    "concentration": "mM",
-}
 
 
 def _ensure_finite(name: str, value: float) -> float:
@@ -400,22 +391,10 @@ class ProposeDoeExperimentsRequest(StrictBaseModel):
             required_keys=REQUIRED_PARAMETER_NAMES,
         )
 
-class MetadataofRun(StrictBaseModel):
-    model_identifier: str
-    model_version: str
-    solver: Dict[str, Any]
-    units_map: Dict[str, str]
-    warnings: List[str] = Field(default_factory=list)
-    diagnostics: Dict[str, Any] = Field(default_factory=dict)
-    deterministic: bool
-    seed: Optional[int]
-
-
 class EstimateDoeParametersResponse(StrictBaseModel):
     parameters: Dict[str, float]
     loss_trace: List[float]
     predictions: Dict[str, List[float]]
-    metadata: MetadataofRun
 
     @validator("parameters")
     def validate_parameters(cls, value: Dict[str, float]) -> Dict[str, float]:
@@ -451,7 +430,6 @@ class ProposeDoeExperimentsResponse(StrictBaseModel):
     proposed_conditions: List[Condition]
     encoded_proposals: List[List[float]]
     loss_trace: List[float]
-    metadata: MetadataofRun
 
     @validator("proposed_conditions")
     def validate_proposed_conditions(cls, value: List[Condition]) -> List[Condition]:

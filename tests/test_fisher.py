@@ -21,17 +21,17 @@ class SimpleEnzyme(doe.common.ODEModel[Parameters]):
     rate = E * parameters.q * A / (parameters.K_A + A) * B / (B + parameters.K_B)
     return jnp.stack([-rate, -rate, jnp.zeros_like(rate)], axis=-1)
 
-  def observables(self, state: jax.Array) -> jax.Array:
+  def observables(self, state: jax.Array, parameters: Parameters) -> jax.Array:
     return state[..., 0]
 
 
 def test_fisher(plot_root, seed):
-  root = os.path.dirname(__file__)
+  root = os.path.dirname(os.path.dirname(__file__))
 
-  with open(os.path.join(root, 'example.json'), 'r') as f:
+  with open(os.path.join(root, 'data', 'experiments', 'example.json'), 'r') as f:
     conditions_data = json.load(f)
 
-  with open(os.path.join(root, 'measurements.json'), 'r') as f:
+  with open(os.path.join(root, 'data', 'experiments', 'measurements.json'), 'r') as f:
     measurements_data = json.load(f)
 
   labels = [k for k in conditions_data]

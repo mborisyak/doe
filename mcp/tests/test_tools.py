@@ -6,10 +6,8 @@ from typing import Any, Dict
 
 from mcp_contracts import (
     Condition,
-    DYNAMIC_MODEL_IDENTIFIER,
     EstimateDoeParametersResponse,
     ProposeDoeExperimentsResponse,
-    MetadataofRun,
 )
 from mcp_errors import ToolExecutionError
 from mcp_tools import DoeMcpService
@@ -101,16 +99,6 @@ class FakeEngine:
                 "experiment 1": [0.54, 0.40, 0.32],
                 "experiment 2": [0.55, 0.34, 0.24],
             },
-            metadata=MetadataofRun(
-                model_identifier=DYNAMIC_MODEL_IDENTIFIER,
-                model_version="1.0.0",
-                solver={"id": "optax.lbfgs", "configuration": {}},
-                units_map={"time": "s", "concentration": "mM"},
-                warnings=[],
-                diagnostics={},
-                deterministic=True,
-                seed=None,
-            ),
         )
 
     def propose_experiments(self, request: Any) -> ProposeDoeExperimentsResponse:
@@ -128,16 +116,6 @@ class FakeEngine:
                 [0.5, 0.6, 0.7, 0.8],
             ],
             loss_trace=[10.0, 8.0, 7.0],
-            metadata=MetadataofRun(
-                model_identifier=DYNAMIC_MODEL_IDENTIFIER,
-                model_version="1.0.0",
-                solver={"id": "fisher.armijo", "configuration": {}},
-                units_map={"time": "s", "concentration": "mM"},
-                warnings=[],
-                diagnostics={},
-                deterministic=True,
-                seed=request.proposal_config.seed,
-            ),
         )
 
 
@@ -151,7 +129,6 @@ def test_estimate_response_shape_is_stable() -> None:
         "parameters",
         "loss_trace",
         "predictions",
-        "metadata",
     }
 
 
@@ -165,7 +142,6 @@ def test_propose_response_shape_is_stable() -> None:
         "proposed_conditions",
         "encoded_proposals",
         "loss_trace",
-        "metadata",
     }
 
 

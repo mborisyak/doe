@@ -17,8 +17,6 @@ except ImportError:  # pragma: no cover
     from doe.doe.common import CustomODESystem, ODEModel
 
 from mcp_contracts import (
-    DEFAULT_UNITS_MAP,
-    DYNAMIC_MODEL_IDENTIFIER,
     REQUIRED_CONDITION_NAMES,
     REQUIRED_PARAMETER_NAMES,
     Condition,
@@ -26,32 +24,13 @@ from mcp_contracts import (
     EstimateDoeParametersResponse,
     ProposeDoeExperimentsRequest,
     ProposeDoeExperimentsResponse,
-    MetadataofRun,
 )
 from mcp_errors import ToolExecutionError
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    import tomli as tomllib  # type: ignore
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DOE_ROOT = REPO_ROOT / "doe"
 
 ParameterTuple = namedtuple("Parameters", REQUIRED_PARAMETER_NAMES)
-
-
-def _read_model_version(doe_root: Path) -> str:
-    pyproject_path = doe_root / "pyproject.toml"
-    if not pyproject_path.exists():
-        return "unknown"
-
-    try:
-        with pyproject_path.open("rb") as stream:
-            data = tomllib.load(stream)
-        return str(data["project"]["version"])
-    except Exception:
-        return "unknown"
 
 
 def _ensure_finite_values(name: str, values: Iterable[float]) -> None:
@@ -91,7 +70,6 @@ class DoeEngine:
         doe_root: Path = DEFAULT_DOE_ROOT,
     ) -> None:
         self.doe_root = doe_root
-        self.model_version = _read_model_version(doe_root)
         self._mle_script = self.doe_root / "scripts" / "mle.py"
         self._new_exp_script = self.doe_root / "scripts" / "new_exp.py"
 
@@ -340,35 +318,10 @@ class DoeEngine:
             _ensure_finite_values(f"predictions.{label}", parsed_series)
             prediction_payload[label] = parsed_series
 
-        metadata = MetadataofRun(
-            model_identifier=DYNAMIC_MODEL_IDENTIFIER,
-            model_version=self.model_version,
-            solver={
-                "id": "optax.lbfgs",
-                "configuration": {
-                    "iterations": request.optimizer.iterations,
-                    "rtol": request.optimizer.rtol,
-                    "dtype": request.optimizer.dtype,
-                },
-            },
-            units_map=DEFAULT_UNITS_MAP,
-            warnings=[],
-            diagnostics={
-                "num_experiments": len(ordered_labels),
-                "num_timestamps": {
-                    label: len(request.measurements[label].timestamps)
-                    for label in ordered_labels
-                },
-            },
-            deterministic=True,
-            seed=None,
-        )
-
         return EstimateDoeParametersResponse(
             parameters=parameters,
             loss_trace=loss_trace,
             predictions=prediction_payload,
-            metadata=metadata,
         )
 
     def propose_experiments(
@@ -518,30 +471,8 @@ class DoeEngine:
 
             proposed_conditions.append(condition)
 
-        metadata = MetadataofRun(
-            model_identifier=DYNAMIC_MODEL_IDENTIFIER,
-            model_version=self.model_version,
-            solver={
-                "id": "fisher.armijo",
-                "configuration": {
-                    "criterion": request.proposal_config.criterion,
-                    "iterations": request.proposal_config.iterations,
-                    "regularization": request.proposal_config.regularization,
-                },
-            },
-            units_map=DEFAULT_UNITS_MAP,
-            warnings=[],
-            diagnostics={
-                "history_experiments": len(ordered_labels),
-                "proposal_count": request.proposal_config.n_proposals,
-            },
-            deterministic=True,
-            seed=request.proposal_config.seed,
-        )
-
         return ProposeDoeExperimentsResponse(
             proposed_conditions=proposed_conditions,
             encoded_proposals=encoded_proposals,
             loss_trace=loss_trace,
-            metadata=metadata,
         )
