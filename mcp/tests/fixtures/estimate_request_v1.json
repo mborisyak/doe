@@ -1,0 +1,55 @@
+{
+  "model_spec": {
+    "states": ["A", "B", "E"],
+    "parameters": {
+      "q": [100.0, 2000.0],
+      "K_A": [0.01, 2.0],
+      "K_B": [0.01, 2.0]
+    },
+    "initial_state": {
+      "A": "A0",
+      "B": "B0",
+      "E": "E0"
+    },
+    "algebraics": {
+      "rate": "E * q * A / (K_A + A) * B / (K_B + B)"
+    },
+    "rhs": {
+      "A": "-rate",
+      "B": "-rate",
+      "E": "0"
+    },
+    "observables": {
+      "A": "A"
+    }
+  },
+  "conditions": {
+    "experiment 1": {
+      "A": 1.0,
+      "B": 2.0,
+      "E": 1.0,
+      "temperature": 10.0
+    },
+    "experiment 2": {
+      "A": 1.0,
+      "B": 1.2,
+      "E": 1.0,
+      "temperature": 50.0
+    }
+  },
+  "measurements": {
+    "experiment 1": {
+      "timestamps": [3.0, 6.0, 9.0],
+      "measurements": [0.5368691927641888, 0.4134818882909769, 0.3104330925377248]
+    },
+    "experiment 2": {
+      "timestamps": [3.0, 6.0, 9.0],
+      "measurements": [0.5427436229457682, 0.32946896884835236, 0.22967635667338676]
+    }
+  },
+  "optimizer": {
+    "iterations": 16,
+    "rtol": 1e-6,
+    "dtype": "float32"
+  }
+}
