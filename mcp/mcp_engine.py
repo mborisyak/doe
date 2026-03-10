@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import namedtuple
 import json
 import os
 from pathlib import Path
@@ -18,7 +17,6 @@ except ImportError:  # pragma: no cover
 
 from mcp_contracts import (
     REQUIRED_CONDITION_NAMES,
-    REQUIRED_PARAMETER_NAMES,
     Condition,
     EstimateDoeParametersRequest,
     EstimateDoeParametersResponse,
@@ -29,8 +27,6 @@ from mcp_errors import ToolExecutionError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DOE_ROOT = REPO_ROOT / "doe"
-
-ParameterTuple = namedtuple("Parameters", REQUIRED_PARAMETER_NAMES)
 
 
 def _ensure_finite_values(name: str, values: Iterable[float]) -> None:
@@ -76,7 +72,7 @@ class DoeEngine:
     def _create_model(
         self,
         model_spec: Dict[str, Any],
-    ) -> ODEModel[ParameterTuple]:
+    ) -> ODEModel[Any]:
         if len(model_spec) == 0:
             raise _invalid_model_spec("model_spec must be a non-empty object.")
         try:
@@ -211,6 +207,7 @@ class DoeEngine:
         request: EstimateDoeParametersRequest,
     ) -> EstimateDoeParametersResponse:
         self._create_model(request.model_spec)
+        expected_parameter_names = tuple(request.model_spec["parameters"].keys())
 
         ordered_labels = sorted(request.conditions.keys())
         conditions_payload = {
@@ -270,9 +267,27 @@ class DoeEngine:
                 message="Malformed script output: parameters must be an object.",
             )
 
+        expected_parameter_set = set(expected_parameter_names)
+        raw_parameter_set = set(raw_parameters.keys())
+        if raw_parameter_set != expected_parameter_set:
+            missing = sorted(expected_parameter_set - raw_parameter_set)
+            extra = sorted(raw_parameter_set - expected_parameter_set)
+            details: List[str] = []
+            if missing:
+                details.append(f"missing keys: {', '.join(missing)}")
+            if extra:
+                details.append(f"unexpected keys: {', '.join(extra)}")
+            raise ToolExecutionError(
+                code="execution_failed",
+                message=(
+                    "Malformed script output: parameters keys mismatch "
+                    f"({'; '.join(details)})."
+                ),
+            )
+
         try:
             parameters = {
-                name: float(raw_parameters[name]) for name in REQUIRED_PARAMETER_NAMES
+                name: float(raw_parameters[name]) for name in expected_parameter_names
             }
         except (KeyError, TypeError, ValueError) as exc:
             raise ToolExecutionError(
