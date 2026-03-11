@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from pathlib import Path
+import re
 from typing import Any, Dict
 
 import pytest
@@ -14,6 +15,7 @@ except ImportError:  # pragma: no cover
 
 from mcp_contracts import (
     EstimateDoeParametersRequest,
+    EstimateDoeParametersResponse,
     ProposeDoeExperimentsRequest,
 )
 
@@ -80,6 +82,38 @@ def _dynamic_model_spec() -> Dict[str, Any]:
         if candidate.is_file():
             return _load_json(candidate)
     return _load_json(FIXTURES / "model_spec_example.json")
+
+
+def _replace_parameter_symbols(expression: str, rename_map: Dict[str, str]) -> str:
+    pattern = re.compile(
+        r"\b(" + "|".join(re.escape(name) for name in rename_map.keys()) + r")\b"
+    )
+    return pattern.sub(lambda match: rename_map[match.group(0)], expression)
+
+
+def _rename_model_spec_parameters(
+    model_spec: Dict[str, Any],
+    rename_map: Dict[str, str],
+) -> Dict[str, Any]:
+    renamed = deepcopy(model_spec)
+    renamed["parameters"] = {
+        rename_map.get(name, name): bounds
+        for name, bounds in renamed["parameters"].items()
+    }
+
+    for section in ("algebraics", "rhs", "observables"):
+        section_payload = renamed.get(section)
+        if isinstance(section_payload, dict):
+            renamed[section] = {
+                name: (
+                    _replace_parameter_symbols(expression, rename_map)
+                    if isinstance(expression, str)
+                    else expression
+                )
+                for name, expression in section_payload.items()
+            }
+
+    return renamed
 
 
 def test_estimate_request_applies_defaults(
@@ -186,6 +220,43 @@ def test_estimate_request_rejects_mismatched_measurement_lengths(
         EstimateDoeParametersRequest.parse_obj(payload)
 
 
+def test_estimate_request_accepts_dynamic_parameter_names(
+    conditions_fixture: Dict[str, Dict[str, float]],
+    measurements_fixture: Dict[str, Dict[str, Any]],
+) -> None:
+    payload = _estimate_payload(conditions_fixture, measurements_fixture)
+    rename_map = {"q": "theta_q", "K_A": "theta_a", "K_B": "theta_b"}
+    payload["model_spec"] = _rename_model_spec_parameters(payload["model_spec"], rename_map)
+    payload["initial_parameters"] = {
+        "theta_q": 818.4,
+        "theta_a": 0.42,
+        "theta_b": 0.67,
+    }
+
+    parsed = EstimateDoeParametersRequest.parse_obj(payload)
+
+    assert set(parsed.model_spec["parameters"].keys()) == {
+        "theta_q",
+        "theta_a",
+        "theta_b",
+    }
+    assert set(parsed.initial_parameters.keys()) == {"theta_q", "theta_a", "theta_b"}
+
+
+def test_estimate_request_rejects_initial_parameters_key_mismatch(
+    conditions_fixture: Dict[str, Dict[str, float]],
+    measurements_fixture: Dict[str, Dict[str, Any]],
+) -> None:
+    payload = _estimate_payload(conditions_fixture, measurements_fixture)
+    payload["initial_parameters"] = {
+        "q": 818.4,
+        "K_A": 0.42,
+    }
+
+    with pytest.raises(ValidationError):
+        EstimateDoeParametersRequest.parse_obj(payload)
+
+
 def test_propose_request_rejects_missing_seed(
     conditions_fixture: Dict[str, Dict[str, float]],
 ) -> None:
@@ -260,6 +331,39 @@ def test_propose_request_rejects_invalid_model_spec_parameter_bounds(
         ProposeDoeExperimentsRequest.parse_obj(payload)
 
 
+def test_propose_request_accepts_dynamic_parameter_names(
+    conditions_fixture: Dict[str, Dict[str, float]],
+) -> None:
+    payload = _propose_payload(conditions_fixture)
+    rename_map = {"q": "theta_q", "K_A": "theta_a", "K_B": "theta_b"}
+    payload["model_spec"] = _rename_model_spec_parameters(payload["model_spec"], rename_map)
+    payload["parameters"] = {
+        "theta_q": 818.4,
+        "theta_a": 0.42,
+        "theta_b": 0.67,
+    }
+
+    parsed = ProposeDoeExperimentsRequest.parse_obj(payload)
+
+    assert set(parsed.model_spec["parameters"].keys()) == {
+        "theta_q",
+        "theta_a",
+        "theta_b",
+    }
+    assert set(parsed.parameters.keys()) == {"theta_q", "theta_a", "theta_b"}
+
+
+def test_propose_request_rejects_parameter_key_mismatch_with_model_spec(
+    conditions_fixture: Dict[str, Dict[str, float]],
+) -> None:
+    payload = _propose_payload(conditions_fixture)
+    rename_map = {"q": "theta_q", "K_A": "theta_a", "K_B": "theta_b"}
+    payload["model_spec"] = _rename_model_spec_parameters(payload["model_spec"], rename_map)
+
+    with pytest.raises(ValidationError):
+        ProposeDoeExperimentsRequest.parse_obj(payload)
+
+
 def test_estimate_request_requires_model_spec(
     conditions_fixture: Dict[str, Dict[str, float]],
     measurements_fixture: Dict[str, Dict[str, Any]],
@@ -300,3 +404,15 @@ def test_propose_request_is_valid_when_model_spec_is_provided(
 
     parsed = ProposeDoeExperimentsRequest.parse_obj(payload)
     assert parsed.model_spec is not None
+
+
+def test_estimate_response_accepts_dynamic_parameter_names() -> None:
+    parsed = EstimateDoeParametersResponse.parse_obj(
+        {
+            "parameters": {"theta_q": 818.4, "theta_a": 0.42, "theta_b": 0.67},
+            "loss_trace": [0.2, 0.1, 0.05],
+            "predictions": {"experiment 1": [0.5, 0.4, 0.3]},
+        }
+    )
+
+    assert set(parsed.parameters.keys()) == {"theta_q", "theta_a", "theta_b"}

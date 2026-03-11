@@ -11,7 +11,6 @@ from mcp_contracts import (
     EstimateDoeParametersRequest,
     ProposeDoeExperimentsRequest,
     REQUIRED_CONDITION_NAMES,
-    REQUIRED_PARAMETER_NAMES,
 )
 from mcp_engine import DoeEngine
 from mcp_errors import ToolExecutionError
@@ -100,7 +99,7 @@ def test_engine_estimate_returns_finite_outputs(
 
     response = engine.estimate_parameters(request)
 
-    assert set(response.parameters.keys()) == set(REQUIRED_PARAMETER_NAMES)
+    assert set(response.parameters.keys()) == set(request.model_spec["parameters"].keys())
     assert response.loss_trace
     assert np.all(np.isfinite(np.array(response.loss_trace)))
     assert set(response.predictions.keys()) == set(conditions_fixture.keys())
