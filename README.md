@@ -164,7 +164,7 @@ The DOE library code and DOE reference tests are vendored in this repo under `do
 
 
 - model input: required `model_spec` JSON object (CustomODESystem schema)
-- parameter names: `q`, `K_A`, `K_B`
+- parameter names: dynamic; derived from `model_spec.parameters` keys
 - condition fields: `A`, `B`, `E`, `temperature`
 
 The engine validates `model_spec` with DOE `CustomODESystem`, then delegates heavy computation to CLI scripts:
@@ -283,7 +283,7 @@ Fits model parameters from historical data using `doe.inference.maximum_likeliho
 - `conditions` (required): map `label -> {A, B, E, temperature}`
 - `measurements` (required): map `label -> {timestamps[], measurements[]}`
 - parameter bounds come from `model_spec.parameters`
-- `initial_parameters` (optional): `{q, K_A, K_B}`
+- `initial_parameters` (optional): map with exactly the same keys as `model_spec.parameters`
 - `optimizer` (optional):
   - `iterations` (default `512`)
   - `rtol` (default `1e-6`)
@@ -341,7 +341,7 @@ Proposes new experiment conditions via `doe.doe.Fisher.propose`.
 - `model_spec` (required; must follow `CustomODESystem` schema)
 - `condition_ranges` (required): bounds for `A`, `B`, `E`, `temperature`
 - parameter bounds come from `model_spec.parameters`
-- `parameters` (required): current parameter estimate `{q, K_A, K_B}`
+- `parameters` (required): current parameter estimate with exactly the same keys as `model_spec.parameters`
 - `history` (required):
   - `conditions`: map `label -> condition`
   - `timestamps`: map `label -> [t1, t2, ...]`
@@ -414,6 +414,7 @@ Params for `model_spec` are extracted from `data/models/simple.json` in (https:/
 
 Dynamic model specs are passed directly to DOE `CustomODESystem`.
 Params for `model_spec` are extracted from `data/models/simple.json` in (https://github.com/mborisyak/doe) (`tests/simple.json` in older revisions).
+The keys under `model_spec.parameters` define the required keys for `initial_parameters`, request `parameters`, and response `parameters`.
 
 Example:
 
@@ -512,7 +513,9 @@ Core validations enforced in `mcp_contracts.py`:
   - strictly increasing
 - measurement/timestamp length match
 - range constraints:
-  - exact required keys
+  - `model_spec.parameters` must be a non-empty map
+  - `condition_ranges` must use exact condition keys (`A`, `B`, `E`, `temperature`)
+  - parameter maps (`initial_parameters`, request `parameters`) must exactly match `model_spec.parameters` keys
   - exactly two values per range
   - `high > low`
 - `proposal_config.criterion` must be `A` or `D`

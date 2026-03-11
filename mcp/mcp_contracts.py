@@ -8,7 +8,6 @@ try:
 except ImportError:  # pragma: no cover
     from pydantic import BaseModel, Field, root_validator, validator
 
-REQUIRED_PARAMETER_NAMES: Tuple[str, ...] = ("q", "K_A", "K_B")
 REQUIRED_CONDITION_NAMES: Tuple[str, ...] = ("A", "B", "E", "temperature")
 
 
@@ -18,15 +17,15 @@ def _ensure_finite(name: str, value: float) -> float:
     return value
 
 
-def _validate_range_map(
+def _validate_key_set(
     *,
     map_name: str,
-    value: Dict[str, List[float]],
+    keys: set[str],
     required_keys: Tuple[str, ...],
-) -> Dict[str, List[float]]:
-    if set(value.keys()) != set(required_keys):
-        missing = sorted(set(required_keys) - set(value.keys()))
-        extra = sorted(set(value.keys()) - set(required_keys))
+) -> None:
+    if keys != set(required_keys):
+        missing = sorted(set(required_keys) - keys)
+        extra = sorted(keys - set(required_keys))
         details: List[str] = []
         if missing:
             details.append(f"missing keys: {', '.join(missing)}")
@@ -34,8 +33,27 @@ def _validate_range_map(
             details.append(f"unexpected keys: {', '.join(extra)}")
         raise ValueError(f"{map_name} keys mismatch ({'; '.join(details)}).")
 
+
+def _validate_range_map(
+    *,
+    map_name: str,
+    value: Dict[str, List[float]],
+    required_keys: Optional[Tuple[str, ...]] = None,
+) -> Dict[str, List[float]]:
+    if required_keys is not None:
+        _validate_key_set(
+            map_name=map_name,
+            keys=set(value.keys()),
+            required_keys=required_keys,
+        )
+        keys_to_validate = required_keys
+    else:
+        if not value:
+            raise ValueError(f"{map_name} must contain at least one key.")
+        keys_to_validate = tuple(value.keys())
+
     cleaned: Dict[str, List[float]] = {}
-    for key in required_keys:
+    for key in keys_to_validate:
         bounds = value[key]
         if len(bounds) != 2:
             raise ValueError(f"{map_name}.{key} must have exactly two values.")
@@ -52,22 +70,31 @@ def _validate_scalar_map(
     *,
     map_name: str,
     value: Dict[str, float],
-    required_keys: Tuple[str, ...],
+    required_keys: Optional[Tuple[str, ...]] = None,
 ) -> Dict[str, float]:
-    if set(value.keys()) != set(required_keys):
-        missing = sorted(set(required_keys) - set(value.keys()))
-        extra = sorted(set(value.keys()) - set(required_keys))
-        details: List[str] = []
-        if missing:
-            details.append(f"missing keys: {', '.join(missing)}")
-        if extra:
-            details.append(f"unexpected keys: {', '.join(extra)}")
-        raise ValueError(f"{map_name} keys mismatch ({'; '.join(details)}).")
+    if required_keys is not None:
+        _validate_key_set(
+            map_name=map_name,
+            keys=set(value.keys()),
+            required_keys=required_keys,
+        )
+        keys_to_validate = required_keys
+    else:
+        if not value:
+            raise ValueError(f"{map_name} must contain at least one key.")
+        keys_to_validate = tuple(value.keys())
 
     cleaned: Dict[str, float] = {}
-    for key in required_keys:
+    for key in keys_to_validate:
         cleaned[key] = _ensure_finite(f"{map_name}.{key}", float(value[key]))
     return cleaned
+
+
+def _model_spec_parameter_names(model_spec: Dict[str, Any]) -> Tuple[str, ...]:
+    parameters = model_spec.get("parameters")
+    if not isinstance(parameters, dict) or not parameters:
+        raise ValueError("model_spec.parameters must contain at least one key.")
+    return tuple(parameters.keys())
 
 
 def _validate_model_spec_input(value: Dict[str, Any]) -> Dict[str, Any]:
@@ -81,7 +108,6 @@ def _validate_model_spec_input(value: Dict[str, Any]) -> Dict[str, Any]:
     cleaned_parameters = _validate_range_map(
         map_name="model_spec.parameters",
         value=parameters,
-        required_keys=REQUIRED_PARAMETER_NAMES,
     )
 
     normalized = dict(value)
@@ -246,13 +272,14 @@ class EstimateDoeParametersRequest(StrictBaseModel):
         return _validate_scalar_map(
             map_name="initial_parameters",
             value=value,
-            required_keys=REQUIRED_PARAMETER_NAMES,
         )
 
     @root_validator
     def validate_label_alignment(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         conditions = values.get("conditions") or {}
         measurements = values.get("measurements") or {}
+        model_spec = values.get("model_spec")
+        initial_parameters = values.get("initial_parameters")
 
         condition_labels = set(conditions.keys())
         measurement_labels = set(measurements.keys())
@@ -266,6 +293,13 @@ class EstimateDoeParametersRequest(StrictBaseModel):
                 details.append(f"measurements without conditions: {', '.join(extra)}")
             raise ValueError(
                 f"conditions/measurements labels mismatch ({'; '.join(details)})."
+            )
+
+        if isinstance(model_spec, dict) and isinstance(initial_parameters, dict):
+            _validate_key_set(
+                map_name="initial_parameters",
+                keys=set(initial_parameters.keys()),
+                required_keys=_model_spec_parameter_names(model_spec),
             )
         return values
 
@@ -388,8 +422,20 @@ class ProposeDoeExperimentsRequest(StrictBaseModel):
         return _validate_scalar_map(
             map_name="parameters",
             value=value,
-            required_keys=REQUIRED_PARAMETER_NAMES,
         )
+
+    @root_validator
+    def validate_parameter_keys(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        model_spec = values.get("model_spec")
+        parameters = values.get("parameters")
+        if isinstance(model_spec, dict) and isinstance(parameters, dict):
+            _validate_key_set(
+                map_name="parameters",
+                keys=set(parameters.keys()),
+                required_keys=_model_spec_parameter_names(model_spec),
+            )
+        return values
+
 
 class EstimateDoeParametersResponse(StrictBaseModel):
     parameters: Dict[str, float]
@@ -401,7 +447,6 @@ class EstimateDoeParametersResponse(StrictBaseModel):
         return _validate_scalar_map(
             map_name="parameters",
             value=value,
-            required_keys=REQUIRED_PARAMETER_NAMES,
         )
 
     @validator("loss_trace")
