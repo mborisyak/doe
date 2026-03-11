@@ -1,0 +1,16 @@
+experiment:
+  duration: 30.0
+  measurements: 10
+
+### concentrations of solutions, in mM
+solutions:
+  A: 3.0
+  B: 3.0
+  E: 3.0e-3
+
+maximal_volume: 1.0 # mL
+
+bounds:
+  temperature: [0.0, 100.0]
+
+noise: 0.025

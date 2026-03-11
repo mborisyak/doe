@@ -137,8 +137,8 @@ class CustomODESystem(ODEModel):
 
     assert tuple(spec['observables']) == ('A', )
 
-    obs_expr = sp.parse_expr(spec['observables']['A'], local_dict=states)
-    self._observables_compiled = sp.lambdify(states.values(), obs_expr, "jax")
+    obs_expr = sp.parse_expr(spec['observables']['A'], local_dict={**states, **parameters})
+    self._observables_compiled = sp.lambdify([*states.values(), *parameters.values()], obs_expr, "jax")
     
     super().__init__()
 
@@ -159,5 +159,6 @@ class CustomODESystem(ODEModel):
 
   def observables(self, state, parameters):
     named_states = [state[..., i] for i, _ in enumerate(self.states)]
-    obs = self._observables_compiled(*named_states)
+    named_parameters = [getattr(parameters, name) for name in self.parameters]
+    obs = self._observables_compiled(*named_states, *named_parameters)
     return obs
