@@ -1,6 +1,9 @@
+import jax
+import jax.numpy as jnp
 import pytest
+import os
 
-import jax; jax.config.update('jax_platform_name', 'cpu')
+from jax import config; config.update("jax_enable_x64", False); config.update('jax_platform_name', 'cpu')
 
 @pytest.fixture(scope='function')
 def plot_root(request):
@@ -12,12 +15,28 @@ def plot_root(request):
 
   return root
 
-@pytest.fixture(scope='function')
-def seed(request):
+def get_hashed_seed(name):
   import hashlib
 
   h = hashlib.sha256()
-  h.update(bytes(request.function.__name__, encoding='utf-8'))
+  h.update(bytes(name, encoding='utf-8'))
   digest = h.hexdigest()
 
   return int(digest[:8], 16)
+
+@pytest.fixture(scope='function')
+def seed(request):
+  return get_hashed_seed(request.function.__name__)
+
+@pytest.fixture(scope='function')
+def rng(request):
+  seed = get_hashed_seed(request.function.__name__)
+  return jax.random.PRNGKey(seed)
+
+@pytest.fixture(scope='function')
+def no_jit():
+  import jax
+  with jax.disable_jit() as context:
+    yield context
+
+  pass

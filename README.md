@@ -83,7 +83,7 @@ From the repository root, you can run helper scripts directly.
 
 ```bash
 PYTHONPATH=. python scripts/mle.py \
-  --model data/models/simple.json \
+  --model data/secret/simple.json \
   --conditions data/experiments/example.json \
   --data data/experiments/measurements.json \
   --iterations 512 \
@@ -94,7 +94,7 @@ PYTHONPATH=. python scripts/mle.py \
 
 ```bash
 PYTHONPATH=. python scripts/new_exp.py \
-  --model data/models/simple.json \
+  --model data/secret/simple.json \
   --conditions data/experiments/example.json \
   --data data/experiments/measurements.json \
   --parameters fitted.json \

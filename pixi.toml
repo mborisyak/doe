@@ -3,20 +3,19 @@ authors = ["Mark"]
 channels = ["conda-forge"]
 name = "doe"
 platforms = ["linux-64"]
-version = "0.0.1"
+version = "0.1.0"
 
 [tasks]
-setup = "PYTHONPATH=.:mcp python -c \"import black, diffrax, doe, jax, mcp, mcp_contracts, mcp_engine, mcp_errors, mcp_tools, numpy, optax, pydantic, pytest, ruff, sympy; print('setup complete')\""
-test = { depends-on = ["test-mcp", "test-doe"] }
-test-mcp = "PYTHONPATH=.:mcp pytest mcp/tests"
-test-doe = "PYTHONPATH=. pytest tests"
+setup = "PYTHONPATH=.:mcp python -c \"import black, diffrax, doe, jax, matplotlib, mcp, mcp_contracts, mcp_engine, mcp_errors, mcp_tools, numpy, optax, pydantic, pytest, pyyaml, ruff, sympy; print('setup complete')\""
+test = { depends-on = ["test-mcp"] }
+test-mcp = "PYTHONPATH=.:mcp pytest tests/mcp"
 lint = { depends-on = ["lint-ruff", "lint-black"] }
 lint-ruff = "ruff check mcp tests"
 lint-black = "black --check --workers 1 mcp tests"
 format = { depends-on = ["format-black", "format-ruff"] }
 format-black = "black mcp tests"
 format-ruff = "ruff check --fix mcp tests"
-run = "PYTHONPATH=. python mcp/server.py"
+run = "PYTHONPATH=.:mcp python mcp/server.py"
 
 [dependencies]
 python = ">=3.11,<3.13"
@@ -33,6 +32,7 @@ numpy = ">=2.0.0"
 optax = ">=0.2.6"
 pydantic = ">=2.0.0"
 pytest = ">=8"
+pyyaml = ">=6.0.0"
 ruff = ">=0.6.0"
 sympy = ">=1.14.0"
 doe = { path = ".", editable = true }

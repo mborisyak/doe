@@ -26,8 +26,8 @@ def _load_json(path: Path) -> Dict[str, Any]:
 
 def _dynamic_model_spec() -> Dict[str, Any]:
     for candidate in (
-        DATA_ROOT / "models" / "simple.json",
-        DOE_ROOT / "data" / "models" / "simple.json",
+        DATA_ROOT / "secret" / "simple.json",
+        DOE_ROOT / "data" / "secret" / "simple.json",
         DOE_ROOT / "tests" / "simple.json",
     ):
         if candidate.is_file():

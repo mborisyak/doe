@@ -6,7 +6,7 @@ Usage:
 
 Example:
   python scripts/new_exp.py \
-    --model data/models/simple.json \
+    --model data/secret/simple.json \
     --conditions data/experiments/example.json \
     --data data/experiments/measurements.json \
     --parameters fitted.json \

@@ -5,7 +5,7 @@ Usage:
   python scripts/mle.py --model MODEL_SPEC.json --conditions CONDITIONS.json --data MEASUREMENTS.json [options]
 
 Example:
-  python scripts/mle.py --model data/models/simple.json --conditions data/experiments/example.json --data data/experiments/measurements.json
+  python scripts/mle.py --model data/secret/simple.json --conditions data/experiments/example.json --data data/experiments/measurements.json
 
 Arguments:
   --model        Path to JSON file defining the CustomODESystem spec.

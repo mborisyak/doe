@@ -8,7 +8,7 @@ Usage:
     (--parameters PARAMS.json | --mle) --timestamps T [T ...] [options]
 
 Example:
-  python scripts/doe.py --model data/models/simple.json \
+  python scripts/doe.py --model data/secret/simple.json \
     --condition-ranges data/experiments/condition_ranges.json \
     --parameters data/experiments/parameters.json \
     --timestamps 3 6 9 12 15 18 21 24 27

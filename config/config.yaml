@@ -1,0 +1,26 @@
+parameters:
+  log_k0_cat: [5.0, 7.5]
+  log_K0_A: [-4.5, 0.0]
+  log_K0_B: [-4.5, 0.0]
+  log_K0i_C: [-5.0, 3.0]
+  log_K0i_D: [-5.0, 3.0]
+  Q10_cat: [1.25, 2.5]
+  Q10_A: [1.1, 1.75]
+  Q10_B: [1.1, 1.75]
+  Q10_C: [1.05, 1.5]
+  Q10_D: [1.05, 1.5]
+  T_melting: [40.0, 70.0]
+  delta_H: [0.375e+5, 1.0e+5]
+  delta_C: [0.375e+3, 1.0e+3]
+
+experiment:
+  duration: 30.0
+  measurements: 9
+
+### concentrations of solutions, in mM
+solutions:
+  A: 3.0
+  B: 3.0
+  E: 3.0e-3
+
+noise: 0.025
