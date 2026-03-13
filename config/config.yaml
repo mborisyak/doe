@@ -17,6 +17,12 @@ experiment:
   duration: 30.0
   measurements: 9
 
+conditions:
+  A: [ 0.1, 5.0 ]
+  B: [ 0.1, 5.0 ]
+  E: [ 0.1, 5.0 ]
+  temperature: [ 0.0, 100.0 ]
+
 ### concentrations of solutions, in mM
 solutions:
   A: 3.0

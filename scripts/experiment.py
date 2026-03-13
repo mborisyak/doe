@@ -2,10 +2,11 @@ import os
 import numpy as np
 
 import jax
+import jax.numpy as jnp
 
 import matplotlib.pyplot as plt
 
-import enzyme
+from doe.secret import enzyme
 
 def get_device(device_name):
   if ':' in device_name:
@@ -33,8 +34,19 @@ def get_rhs(parameters, device):
 
   return rhs, jac
 
-def simulate():
-  pass
+
+def sample_conditions(rng: np.random.Generator, n, config, prefix='experiment_{index}'):
+  ranges = config['conditions']
+  conditions = dict()
+  for i in range(n):
+    label = prefix.format(index=i)
+    conditions[label] = {
+      name: float(rng.uniform(size=(), low=lower, high=upper))
+      for name, (lower, upper) in ranges.items()
+    }
+
+  return conditions
+
 
 def main():
   import argparse
@@ -44,7 +56,17 @@ def main():
   parser.add_argument('--parameters', required=True, help='Path to the parameter file')
   parser.add_argument('--seed', type=int, required=False, default=None, help='Seed for noise generation')
   parser.add_argument('--output', required=True, help='Path to the output file')
-  parser.add_argument('--conditions', required=True, help='JSON file with initial conditions')
+  parser.add_argument(
+    '--conditions', required=True,
+    help='if samples is not set, input JSON file with initial conditions, '
+         'otherwise, output file for randomly generated conditions. '
+         'In the latter case, the file must not exists.'
+  )
+  parser.add_argument(
+    '--samples', required=False, type=int, default=None,
+    help='if set, generates `samples` random conditions, write to `conditions`.'
+  )
+  parser.add_argument('--noiseless', required=False, type=bool, default=False, help='if True, skip noise generation.')
   parser.add_argument('--device', required=False, default='cpu', help='Number of measurements')
   parser.add_argument('--config', required=False, default=None, help='Path to the config file')
   parser.add_argument(
@@ -80,14 +102,25 @@ def main():
   n = config['experiment']['measurements']
   ts_eval = np.linspace(0, T, num=n + 2, dtype=np.float32)[1:-1]
 
-  with open(args.conditions, 'r') as f:
-    import json
-    conditions = json.load(f)
+  rng, rng_conditions = np.random.default_rng(args.seed).spawn(2)
+
+  if args.samples is not None:
+    assert not os.path.exists(args.conditions), 'When `samples` is set, file `condition` must not exist'
+
+    conditions = sample_conditions(rng_conditions, n=args.samples, config=config)
+
+    with open(args.conditions, 'w') as f:
+      import json
+      json.dump(conditions, f, indent=2)
+
+  else:
+    with open(args.conditions, 'r') as f:
+      import json
+      conditions = json.load(f)
 
   results = dict()
   trajectories = dict()
 
-  rng = np.random.default_rng(args.seed)
   sigma = config['noise']
 
   ### concentrations
@@ -115,7 +148,10 @@ def main():
     )
     timestamps = trajectory.t
     y = trajectory.y[0]
-    measurements = y + sigma * rng.normal(size=y.shape).astype(np.float32)
+    if args.noiseless:
+      measurements = y
+    else:
+      measurements = y + sigma * rng.normal(size=y.shape).astype(np.float32)
 
     results[label] = {
       'timestamps': [float(t) for t in timestamps],

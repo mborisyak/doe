@@ -55,7 +55,7 @@ def test_kinetics(seed, plot_root):
   for i, temperature in enumerate(temperatures):
     trajectory = solve_ivp(
       rhs, t_span=(0.0, T), t_eval=ts_eval, y0=A0_,
-      args=(A0_, B0_, E_, temperature), jac=jac
+      args=(A0_, B0_, E_, temperature), jac=jac, method='LSODA'
     )
 
     ts.append(trajectory.t)

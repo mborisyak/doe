@@ -13,7 +13,7 @@ from doe.common import Conditions
 def test_custom_ode(plot_root, seed):
   root = os.path.dirname(os.path.dirname(__file__))
 
-  with open(os.path.join(root, 'data', 'secret', 'simple.json'), 'r') as f:
+  with open(os.path.join(root, 'data', 'models', 'simple.json'), 'r') as f:
     spec = json.load(f)
 
   model = doe.common.CustomODESystem(spec)
