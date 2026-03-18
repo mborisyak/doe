@@ -22,6 +22,8 @@ Conditions = namedtuple('Conditions', ['A', 'B', 'E', 'temperature'])
 ### should be a named tuple
 Parameters = TypeVar('Parameters')
 
+INITIAL_DT = 1.0e-3
+
 def get_initial_concentrations(condition):
   A, B, E, _ = condition
   V_total = A + B + E
@@ -60,12 +62,12 @@ class ODEModel(Generic[Parameters]):
   def trajectory(self, conditions, timestamps, parameters):
     result = diffrax.diffeqsolve(
       self.term, self.solver,
-      dt0=0.1, t0=0, t1=TIME_HORIZON, saveat=diffrax.SaveAt(ts=timestamps),
+      dt0=None, t0=0, t1=TIME_HORIZON, saveat=diffrax.SaveAt(ts=timestamps),
       y0=self.initial_state(conditions),
       args=(conditions, parameters),
-      stepsize_controller=diffrax.ConstantStepSize(),
-      max_steps=int(TIME_HORIZON / 0.1) + 1,
-      adjoint=diffrax.DirectAdjoint(),
+      stepsize_controller=diffrax.PIDController(rtol=1.0e-2, atol=1.0e-2),
+      max_steps=None,
+      adjoint=diffrax.RecursiveCheckpointAdjoint(checkpoints=100),
     )
 
     return result.ys
