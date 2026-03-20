@@ -1,3 +1,63 @@
+20 March 2026
+=========================
+
+doe/doe/fisher.py
+- propose() now accepts controls as a list of Conditions namedtuples and
+  timestamps as a list of arrays; encoding to logit space handled internally
+- Empty history (empty lists) handled cleanly: falls back to zero-shape arrays
+  without special-casing in the caller
+- information() uses jnp.sum(error) / max(J.shape[0], 1) to return 0 for
+  empty arrays instead of NaN from jnp.mean
+- _propose JIT-compiled with device=self.model.device
+- self.timestamps stored on instance for use in empty-history shape inference
+- Returns decoded Conditions namedtuple (pytree of arrays, one entry per
+  proposal) instead of raw encoded array
+
+scripts/new_exp.py
+- Condition ranges and proposal timestamps read from config/config.yaml;
+  --condition-ranges argument removed
+- --parameters is now optional: fits from history when absent, defaults to
+  range centres when no history is provided either
+- --conditions/--data are now optional: no-history case handled explicitly
+- Output includes proposals (decoded conditions), expected (model-predicted
+  trajectories for each proposed condition), and proposal_timestamps
+
+mcp/mcp_contracts.py
+- HistoryConfig: added measurements field (Dict[str, List[float]]) with
+  validator; root validator checks conditions/timestamps/measurements all share
+  the same label set and matching per-label lengths
+- ProposalConfig: removed timestamps field
+- ProposeDoeExperimentsRequest: parameters and history are now Optional
+  (default None); condition_ranges removed
+- ProposeDoeExperimentsResponse: replaced encoded_proposals and loss_trace
+  with expected (List[List[float]]) and proposal_timestamps (List[float])
+
+mcp/mcp_engine.py
+- propose_experiments conditionally passes --conditions/--data and
+  --parameters only when present in the request
+- --condition-ranges no longer written or passed
+- Reads proposals, expected, and proposal_timestamps from script output
+
+tests/mcp/test_doe_contracts.py
+- Updated _propose_payload: added measurements to history, removed
+  condition_ranges and timestamps from proposal_config
+- New tests for optional parameters, optional history, both absent, history
+  missing measurements, measurement length mismatch, label mismatch
+
+tests/mcp/test_doe_tools.py
+- FakeEngine.propose_experiments updated to return expected and
+  proposal_timestamps; test_propose_response_shape_is_stable updated
+
+tests/mcp/test_engine.py
+- _load_condition_ranges() reads from config/config.yaml
+- New integration tests: no-parameters, no-history, neither case
+- Determinism test compares proposed_conditions dicts
+- All propose assertions use expected instead of loss_trace/encoded_proposals
+
+tests/ (new files)
+- test_gradient.py, test_mle_scipy.py, test_observable_jac.py,
+  test_scan_clip_grad.py, test_solve_jac.py, test_stiff_mle.py
+
 04 March 2026
 =========================
 

@@ -62,17 +62,20 @@ fisher = doe.doe.Fisher(
     iterations=64,
 )
 
-# encode past experiments
-controls  = jnp.stack([fisher.encode_conditions(c) for c in past_conditions])
-timestamps = jnp.array([exp['timestamps'] for exp in past_measurements])
-
-# propose 3 new experiments
+# past_conditions: list of Conditions namedtuples
+# past_timestamps: list of timestamp arrays
 key = jax.random.PRNGKey(0)
-loss_trace, proposed = fisher.propose(key, n=3, controls=controls, timestamps=timestamps, parameters=parameters)
+loss_trace, proposed = fisher.propose(
+    key, n=3,
+    controls=past_conditions,    # list of Conditions — encoding handled internally
+    timestamps=past_timestamps,  # list of timestamp arrays
+    parameters=parameters,
+)
 
-# decode back to physical units
-for enc in proposed:
-    print(fisher.decode_conditions(enc))
+# proposed is a Conditions namedtuple with arrays of length n
+for i in range(3):
+    cond = jax.tree.map(lambda x: x[i], proposed)
+    print(cond)
 ```
 
 ## CLI tools
@@ -95,10 +98,6 @@ PYTHONPATH=. python scripts/mle.py \
 ```bash
 PYTHONPATH=. python scripts/new_exp.py \
   --model data/secret/simple.json \
-  --conditions data/experiments/example.json \
-  --data data/experiments/measurements.json \
-  --parameters fitted.json \
-  --condition-ranges condition_ranges.json \
   --n 3 \
   --iterations 64 \
   --criterion D \
@@ -106,18 +105,24 @@ PYTHONPATH=. python scripts/new_exp.py \
   --output proposed.json
 ```
 
-`condition_ranges.json` must define bounds for `A`, `B`, `E`, and `temperature`, for example:
+`--conditions`/`--data` and `--parameters` are all optional:
+- if `--parameters` is omitted and history is provided, parameters are fitted from history automatically
+- if neither is provided, parameters default to the centre of the ranges from `config/config.yaml`
+- condition ranges and proposal timestamps are always read from `config/config.yaml`
 
-```json
-{
-  "A": [0.1, 5.0],
-  "B": [0.1, 5.0],
-  "E": [0.1, 5.0],
-  "temperature": [0.0, 100.0]
-}
+With history:
+
+```bash
+PYTHONPATH=. python scripts/new_exp.py \
+  --model data/secret/simple.json \
+  --conditions data/experiments/example.json \
+  --data data/experiments/measurements.json \
+  --parameters fitted.json \
+  --n 3 --iterations 64 --seed 0 \
+  --output proposed.json
 ```
 
-The `proposed.json` output includes `loss_trace`, `encoded_proposals`, and decoded `proposals` in physical units.
+The `proposed.json` output includes `proposals` (decoded conditions), `expected` (predicted trajectories for each proposal), and `proposal_timestamps`.
 
 ## API overview
 
@@ -334,28 +339,35 @@ Fits model parameters from historical data using `doe.inference.maximum_likeliho
 
 ### 2) `propose_doe_experiments`
 
-Proposes new experiment conditions via `doe.doe.Fisher.propose`.
+Proposes new experiment conditions via `doe.doe.Fisher.propose`. All inputs except `model_spec` and `proposal_config` are optional — the tool falls back gracefully depending on what is provided.
 
 #### Request fields
 
 - `model_spec` (required; must follow `CustomODESystem` schema)
-- `condition_ranges` (required): bounds for `A`, `B`, `E`, `temperature`
 - parameter bounds come from `model_spec.parameters`
-- `parameters` (required): current parameter estimate with exactly the same keys as `model_spec.parameters`
-- `history` (required):
-  - `conditions`: map `label -> condition`
-  - `timestamps`: map `label -> [t1, t2, ...]`
+- condition ranges and proposal timestamps come from `config/config.yaml` server-side
+- `parameters` (optional): current parameter estimate; if omitted, fitted from history or defaulted to range centres
+- `history` (optional):
+  - `conditions`: map `label -> {A, B, E, temperature}`
+  - `timestamps`: map `label -> [t1, t2, ...]` (strictly increasing, >= 2 values)
+  - `measurements`: map `label -> [y1, y2, ...]` (same length as timestamps)
 - `proposal_config` (required):
   - `n_proposals` (>= 1)
-  - `timestamps` (proposal timestamps)
   - `iterations` (default `64`)
   - `criterion` (`"D"` or `"A"`, default `"D"`)
   - `regularization` (optional float)
   - `seed` (required)
 
-#### Example request
+#### Fallback behaviour
 
-Params for `model_spec` are extracted from `data/models/simple.json` in (https://github.com/mborisyak/doe) (`tests/simple.json` in older revisions).
+| `parameters` | `history` | Parameter source |
+|---|---|---|
+| provided | provided | use provided parameters |
+| omitted | provided | fit from history |
+| omitted | omitted | centre of `model_spec.parameters` ranges |
+| provided | omitted | use provided parameters, no history prior |
+
+#### Example request
 
 ```json
 {
@@ -367,12 +379,6 @@ Params for `model_spec` are extracted from `data/models/simple.json` in (https:/
     "rhs": {"A": "-rate", "B": "-rate", "E": "0"},
     "observables": {"A": "A"}
   },
-  "condition_ranges": {
-    "A": [0.1, 5.0],
-    "B": [0.1, 5.0],
-    "E": [0.1, 5.0],
-    "temperature": [0.0, 100.0]
-  },
   "parameters": {"q": 818.4, "K_A": 0.42, "K_B": 0.67},
   "history": {
     "conditions": {
@@ -382,11 +388,14 @@ Params for `model_spec` are extracted from `data/models/simple.json` in (https:/
     "timestamps": {
       "experiment 1": [3.0, 6.0, 9.0],
       "experiment 2": [3.0, 6.0, 9.0]
+    },
+    "measurements": {
+      "experiment 1": [0.54, 0.40, 0.32],
+      "experiment 2": [0.55, 0.34, 0.24]
     }
   },
   "proposal_config": {
     "n_proposals": 3,
-    "timestamps": [1.0, 5.0, 9.0, 13.0, 17.0, 21.0, 25.0, 29.0],
     "iterations": 64,
     "criterion": "D",
     "seed": 12345
@@ -402,11 +411,11 @@ Params for `model_spec` are extracted from `data/models/simple.json` in (https:/
     {"A": 2.4, "B": 4.7, "E": 0.8, "temperature": 63.2},
     {"A": 0.6, "B": 3.5, "E": 1.7, "temperature": 22.4}
   ],
-  "encoded_proposals": [
-    [0.22, 1.4, -0.5, 0.71],
-    [-1.31, 0.88, 0.09, -0.96]
-  ],
-  "loss_trace": [12.8, 10.1, 8.3]
+  "proposal_timestamps": [3.33, 6.67, 10.0, 13.33, 16.67, 20.0, 23.33, 26.67, 30.0],
+  "expected": [
+    [0.48, 0.37, 0.29, 0.23, 0.19, 0.16, 0.14, 0.12, 0.11],
+    [0.51, 0.41, 0.33, 0.27, 0.22, 0.19, 0.16, 0.14, 0.13]
+  ]
 }
 ```
 
@@ -504,22 +513,21 @@ Core validations enforced in `mcp_contracts.py`:
 
 - finite numeric values only (`NaN`/`inf` rejected)
 - no unknown fields (strict models, `extra="forbid"`)
-- non-empty conditions/measurements/history
+- non-empty conditions/measurements where required
 - label-set alignment:
-  - `conditions` == `measurements`
-  - `history.conditions` == `history.timestamps`
-- timestamp constraints:
+  - `fit_parameters`: `conditions` == `measurements`
+  - `propose_doe_experiments` history: `conditions` == `timestamps` == `measurements`
+- timestamp constraints (history and measurements):
   - min length: 2
   - strictly increasing
-- measurement/timestamp length match
+- measurement/timestamp length match per label
 - range constraints:
-  - `model_spec.parameters` must be a non-empty map
-  - `condition_ranges` must use exact condition keys (`A`, `B`, `E`, `temperature`)
-  - parameter maps (`initial_parameters`, request `parameters`) must exactly match `model_spec.parameters` keys
-  - exactly two values per range
-  - `high > low`
-- `proposal_config.criterion` must be `A` or `D`
+  - `model_spec.parameters` must be a non-empty map with `[low, high]` bounds per key
+  - `high > low` for every range
+  - parameter maps (`initial_parameters`, request `parameters`) must exactly match `model_spec.parameters` keys when provided
+- `proposal_config.criterion` must be `"A"` or `"D"`
 - `proposal_config.n_proposals >= 1`
+- `proposal_config.seed` is required
 
 ## Testing and Quality
 
