@@ -56,8 +56,11 @@ def maximum_likelihood_estimate_euler(
     model: ODEModel[Parameters], conditions, data,
     parameter_ranges: Parameters,
     initial=None, optimizer=default_optimizer,
+    batch_size: int | None=None,
     iterations: int | None=None, rtol: float | None=1.0e-6,
-    dtype=jnp.float32, error_tol: float | None=1.0e-3, device=None
+    dtype=jnp.float32, error_tol: float | None=1.0e-3, device=None,
+    seed: int = 987654321,
+    progress: bool=False
 ):
   """
   Returns maximum likelihood fit to the data.
@@ -70,10 +73,13 @@ def maximum_likelihood_estimate_euler(
   :param initial: if provided, an initial guess for the optimizer, middle of ranges if unspecified;
   :param dtype: dtype of computations
   :param optimizer: optax optimizer (or compatible), LBFGS by defult
+  :param batch_size: uses complete gradient if None, otherwise samples mini-batches;
   :param iterations: number of iterations, if rtol specified, the maximal number of iterations
   :param rtol: relative tolerance of stopping criterium.
   :param error_tol: tolerance for the integration error
   :param device: compilation target.
+  :param seed: used for subsampling
+  :param progress: progress bar
   """
 
   label_order = [k for k in conditions]
@@ -113,6 +119,19 @@ def maximum_likelihood_estimate_euler(
     params_encoded_updated = optax.apply_updates(ps_encoded, updates)
     return ls, err, params_encoded_updated, opt_state_updated
 
+  rng = jax.random.PRNGKey(seed)
+  if batch_size is None:
+    def subsample(key, cs, ts, ys):
+      return cs, ts, ys
+
+  else:
+    dataset_size = timestamps.shape[0]
+    def subsample(key, cs, ts, ys):
+      index = jax.random.randint(key, shape=(batch_size, ), minval=0, maxval=dataset_size)
+      return jax.tree.map(lambda x: x[index], (cs, ts, ys))
+
+    subsample = jax.jit(subsample, device=device)
+
   step = jax.jit(step, device=device)
   state = optimizer.init(parameters_encoded)
 
@@ -120,15 +139,38 @@ def maximum_likelihood_estimate_euler(
     if rtol is None:
       raise ValueError('either rtol, iterations or both must be specified')
 
+    if batch_size is not None:
+      import warnings
+      warnings.warn(
+        'It is really, really not recommended to combine stochastic optimization with an auto-stop criterion. '
+        'If it takes forever to complete, set a fixed number of iterations.'
+      )
+
+    if progress:
+      import tqdm
+      pbar = tqdm.tqdm(desc='fitting')
+    else:
+      pbar = None
+
     losses = list()
 
-    l0, err, parameters_encoded, state = step(parameters_encoded, conditions_batched, timestamps, measurements, state)
+    key, rng = jax.random.split(rng, num=2)
+    cs_batch, ts_batch, ys_batch = subsample(key, conditions_batched, timestamps, measurements)
+    l0, err, parameters_encoded, state = step(parameters_encoded, cs_batch, ts_batch, ys_batch, state)
+    if pbar is not None:
+      pbar.update()
+
     losses.append(l0)
     assert error_tol is None or (jnp.isfinite(err) and err < error_tol), \
       f'step 0: Integration error is too large! {err} / {error_tol}'
 
     while True:
-      loss, err, parameters_encoded, state = step(parameters_encoded, conditions_batched, timestamps, measurements, state)
+      key, rng = jax.random.split(rng, num=2)
+      cs_batch, ts_batch, ys_batch = subsample(key, conditions_batched, timestamps, measurements)
+      loss, err, parameters_encoded, state = step(parameters_encoded, cs_batch, ts_batch, ys_batch, state)
+      if pbar is not None:
+        pbar.update()
+
       assert error_tol is None or (jnp.isfinite(err) and err < error_tol), \
         f'step {len(losses) - 1}: Integration error is too large! {err} / {error_tol}'
 
@@ -143,12 +185,26 @@ def maximum_likelihood_estimate_euler(
   else:
     losses = np.ndarray(shape=(iterations, ))
 
-    losses[0], err, parameters_encoded, state = step(parameters_encoded, conditions_batched, timestamps, measurements, state)
+    key, rng = jax.random.split(rng, num=2)
+    cs_batch, ts_batch, ys_batch = subsample(key, conditions_batched, timestamps, measurements)
+    losses[0], err, parameters_encoded, state = step(parameters_encoded, cs_batch, ts_batch, ys_batch, state)
     assert error_tol is None or (jnp.isfinite(err) and err < error_tol), \
       f'step 0: Integration error is too large! {err} / {error_tol}'
 
+    if progress:
+      import tqdm
+      pbar = tqdm.tqdm(desc='fitting', total=iterations)
+      pbar.update()
+    else:
+      pbar = None
+
     for i in range(1, iterations):
-      losses[i], err, parameters_encoded, state = step(parameters_encoded, conditions_batched, timestamps, measurements, state)
+      key, rng = jax.random.split(rng, num=2)
+      cs_batch, ts_batch, ys_batch = subsample(key, conditions_batched, timestamps, measurements)
+      losses[i], err, parameters_encoded, state = step(parameters_encoded, cs_batch, ts_batch, ys_batch, state)
+      if pbar is not None:
+        pbar.update()
+
       assert error_tol is None or (jnp.isfinite(err) and err < error_tol), \
         f'step {i}: Integration error is too large! {err} / {error_tol}'
 

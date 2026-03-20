@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 from doe.common import Conditions
 from doe.common.custom import CustomODESystem
+from doe.inference import maximum_likelihood_estimate_euler
 
 NOISE_STD = 0.025
 
@@ -39,10 +40,20 @@ def parse_args():
                  help='JSON file with the CustomODESystem spec.')
   p.add_argument('--parameters', required=False, default=None, metavar='FILE',
                  help='JSON file with values of model parameters.')
-  p.add_argument('--conditions', required=True, metavar='FILE',
-                 help='JSON file with experimental conditions.')
+  p.add_argument('--train-conditions', required=False, metavar='FILE',
+                 help='JSON file with experimental conditions for training the model (if parameters are not provided).')
+  p.add_argument('--train-measurements', required=False, metavar='FILE',
+                 help='JSON file with experimental measurements for trainin the model (if parameters are not provided).')
   p.add_argument('--ground-truth', required=True, metavar='FILE',
                  help='JSON file with ground-truth measurements.')
+  p.add_argument('--batch-size', required=False, default=32, type=int,
+                 help='batch size for fitting parameters.')
+  p.add_argument('--iterations', required=False, default=32768, type=int,
+                 help='number of gradient iterations.')
+  p.add_argument('--learning-curve', required=False, default=None, type=str, metavar='FILE',
+                 help='plot learning curve if parameters are fitted')
+  p.add_argument('--conditions', required=True, metavar='FILE',
+                 help='JSON file with experimental conditions.')
   p.add_argument('--dtype', choices=('float32', 'float64'), default='float32',
                  help='Numeric dtype for optimisation (default: float32).')
   p.add_argument('--output', metavar='FILE', default=None,
@@ -53,9 +64,46 @@ def parse_args():
                  help='plots 9 worst test cases.')
   return p.parse_args()
 
-def solve(arguments, progress=False):
-  spec, params, conditions, timestamps, dtype = arguments
+def get_parameters(model: CustomODESystem, args):
+  assert (args.train_conditions is None) == (args.train_measurements is None), \
+    'either both --train-conditions and --train-measurements are set or none'
 
+  if args.parameters is not None:
+    with open(args.parameters, 'r') as f:
+      estimation = json.load(f)['parameters']
+      return estimation
+
+  with open(args.train_conditions, 'r') as f:
+    conditions = json.load(f)
+
+  with open(args.train_measurements, 'r') as f:
+    measurements = json.load(f)
+
+  print('Parameters are being inferred from the training data.')
+  losses, estimation, _ = maximum_likelihood_estimate_euler(
+    model, conditions, measurements,
+    parameter_ranges=model.parameter_ranges(),
+    initial=None,
+    batch_size=min(args.batch_size, len(conditions)),
+    iterations=args.iterations,
+    rtol=None,
+    dtype=args.dtype,
+    progress=True
+  )
+
+  estimation = estimation._asdict()
+
+  if args.learning_curve is not None:
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    axes = fig.subplots()
+    axes.plot(losses)
+    fig.savefig(args.learning_curve)
+    plt.close(fig)
+
+  return estimation
+
+def solve(spec, params, conditions, timestamps, dtype, progress=False):
   model = CustomODESystem(spec)
   params = model.Parameters(**{k: jnp.array(v, dtype=dtype) for k, v in params.items()})
 
@@ -84,21 +132,8 @@ def main():
   with open(args.model, 'r') as f:
     spec = json.load(f)
 
-  parameter_ranges = spec['parameters']
-  if args.parameters is None:
-    parameters = []
-    rng = np.random.default_rng(SUPER_SECRET_SEED)
-    for i in range(N_TEST_PARAMETERS):
-      params = {
-        k: rng.uniform(low=low, high=high, size=())
-        for k, (low, high) in parameter_ranges.items()
-      }
-      parameters.append(params)
-
-  else:
-    with open(args.parameters, 'r') as f:
-      estimation = json.load(f)['parameters']
-      parameters = [estimation]
+  model = CustomODESystem(spec)
+  parameters = get_parameters(model, args)
 
   with open(args.conditions, 'r') as f:
     conditions = json.load(f)
@@ -116,44 +151,22 @@ def main():
     print(f'error: experiments in data but missing from conditions: {sorted(missing_cond)}', file=sys.stderr)
     sys.exit(1)
 
-  import multiprocessing as mp
   timestamps = {
     label: np.array(data[label]['timestamps'], dtype=dtype)
     for label in data
   }
 
-  test_label, *_ = conditions
-  model = CustomODESystem(spec)
-  test_conditions = Conditions(**{k: jnp.array(v, dtype=dtype) for k, v in conditions[test_label].items()})
-  params = model.Parameters(**parameters[0])
-  rhs = model.rhs(model.initial_state(test_conditions), test_conditions, params)
-
-  if len(parameters) > 1:
-    context = mp.get_context('spawn')
-    pool = context.Pool(processes=args.cores, )
-    evaluated = pool.map(
-      solve, (
-        (spec, params, conditions, timestamps, dtype)
-        for params in parameters
-      )
-    )
-    predictions, errors = zip(*evaluated)
-  else:
-    predictions, errors = zip(*[
-      solve((spec, params, conditions, timestamps, dtype), progress=True)
-      for params in parameters
-    ])
+  predictions, errors = solve(spec, parameters, conditions, timestamps, dtype)
 
   if np.max(errors) > 1.0e-3:
     print(f'WARNING: integration error {np.max(errors):.3}')
 
-  predictions = np.stack(predictions, axis=0)
   measurements = np.stack([
     data[label]['measurements']
     for label in conditions
   ], axis=0)
 
-  mse = np.mean(np.square(predictions - measurements[None]))
+  mse = np.mean(np.square(predictions - measurements))
   rmse = np.sqrt(mse)
 
   variance = np.var([y for label in data for y in data[label]['measurements']])
@@ -169,7 +182,7 @@ def main():
     for _, condition in conditions.items()
   ], axis=0)
 
-  mse_per_experiment = np.mean(np.square(predictions - measurements[None]), axis=(0, 2))
+  mse_per_experiment = np.mean(np.square(predictions - measurements), axis=(1, ))
 
   from sklearn.ensemble import GradientBoostingRegressor
 
@@ -193,14 +206,10 @@ def main():
     label = labels[k]
     T = np.max(timestamps[label])
     ts = np.linspace(0, T, num=1024)
-    pred, _ = zip(*[
-      solve((spec, params, {label: conditions[label]}, {label: ts}, dtype), progress=False)
-      for params in parameters
-    ])
-    pred = np.stack(pred, axis=0)
+    pred, _ = solve(spec, parameters, {label: conditions[label]}, {label: ts}, dtype)
 
     axes[i].scatter(timestamps[label], measurements[k])
-    axes[i].plot(ts, pred[:, 0].T)
+    axes[i].plot(ts, pred[0])
     conditions_string = ', '.join(f'{f} = {conditions[label][f]:.2f}' for f in Conditions._fields)
     axes[i].set_title(f'{label}\n{conditions_string}')
 

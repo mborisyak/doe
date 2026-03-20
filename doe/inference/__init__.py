@@ -1,1 +1,1 @@
-from .gradient import maximum_likelihood_estimate
+from .gradient import maximum_likelihood_estimate, maximum_likelihood_estimate_euler, maximum_likelihood_estimate_scipy
