@@ -56,7 +56,7 @@ class ArmijoLineSearch:
     Returns (updates, new_state) where new_params = params + updates.
     """
     if value is None:
-      value = value_fn(params)
+      value, _ = value_fn(params)
 
     alpha0, c, rho, max_iters = self.alpha0, self.c, self.rho, self.max_iters
     project = self._project
@@ -69,11 +69,12 @@ class ArmijoLineSearch:
     def body_fn(s):
       a, _, i = s
       new_a = a * rho
-      return new_a, value_fn(project(params - new_a * grads)), i + 1
+      value, _ = value_fn(project(params - new_a * grads))
+      return new_a, value, i + 1
 
     init_candidate = project(params - alpha0 * grads)
     a, _, _ = jax.lax.while_loop(
-      cond_fn, body_fn, (alpha0, value_fn(init_candidate), 0)
+      cond_fn, body_fn, (alpha0, value_fn(init_candidate)[0], 0)
     )
     new_params = project(params - a * grads)
     return new_params - params, ArmijoState()

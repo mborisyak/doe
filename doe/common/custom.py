@@ -85,7 +85,7 @@ class CustomODESystem(ODEModel):
         }
       assigns observable "A" the value of state "A".
   """
-  def __init__(self, spec):
+  def __init__(self, spec, device=None):
     validate_spec(spec)
 
     self.states = spec['states']
@@ -140,11 +140,12 @@ class CustomODESystem(ODEModel):
     obs_expr = sp.parse_expr(spec['observables']['A'], local_dict={**states, **parameters})
     self._observables_compiled = sp.lambdify([*states.values(), *parameters.values()], obs_expr, "jax")
     
-    super().__init__()
+    super().__init__(device=device)
 
   def rhs(self, state, conditions, parameters):
     named_states = [state[..., i] for i, _ in enumerate(self.states)]
-    named_conditions = [conditions.A, conditions.B, conditions.E, conditions.temperature]
+    Ac, Bc, Ec = get_initial_concentrations(conditions)
+    named_conditions = [Ac, Bc, Ec, conditions.temperature]
     named_parameters = [getattr(parameters, name) for name in self.parameters]
 
     return jnp.stack(self._rhs_compiled(*named_states, *named_conditions, *named_parameters), axis=-1)

@@ -16,6 +16,7 @@ parameters:
 experiment:
   duration: 30.0
   measurements: 9
+  batch: 4
 
 conditions:
   A: [ 0.1, 5.0 ]

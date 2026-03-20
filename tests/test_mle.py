@@ -2,6 +2,8 @@ import os
 import json
 from collections import namedtuple
 
+import numpy as np
+
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -12,30 +14,24 @@ from doe.common import Conditions
 
 def test_mle(plot_root, seed):
   root = os.path.dirname(os.path.dirname(__file__))
-  data_path = os.path.join(root, 'data', 'run_2026_03_18_120000')
+  data_path = os.path.join(root, 'data')
 
-  with open(os.path.join(data_path, 'models', 'model_1.json'), 'r') as f:
+  with open(os.path.join(data_path, 'models', 'super-model-2.json'), 'r') as f:
     model_spec = json.load(f)
 
   model = doe.common.CustomODESystem(model_spec)
 
-  with open(os.path.join(data_path, 'simulation_1_output.json'), 'r') as f:
-    data = json.load(f)
-    data = data['result']['data']
+  with open(os.path.join(data_path, 'experiments', 'example.json'), 'r') as f:
+    conditions = json.load(f)
 
-  conditions, measurements = {}, {}
-  for label in data:
-    conditions[label] = data[label]['conditions']
-    measurements[label] = {
-      'timestamps': data[label]['timestamps'],
-      'measurements': data[label]['measurements']
-    }
+  with open(os.path.join(data_path, 'experiments', 'measurements.json'), 'r') as f:
+    measurements = json.load(f)
 
   condition_ranges = Conditions(A=[0.1, 5.0], B=[0.1, 5.0], E=[0.1, 5.0], temperature=[0.0, 100.0])
 
   parameter_ranges = model.parameter_ranges()
   parameters = model.Parameters(**{
-    f: ( + high) / 2
+    f: (low + high) / 2
     for f, (low, high) in zip(parameter_ranges._fields, parameter_ranges)
   })
 
@@ -53,8 +49,10 @@ def test_mle(plot_root, seed):
 
   # estimate parameters from existing data
   losses, parameters, predictions = doe.inference.maximum_likelihood_estimate(
-    model, conditions, measurements, model.parameter_ranges(), iterations=4
+    model, conditions, measurements, model.parameter_ranges(), iterations=None, mode='euler'
   )
+
+  print(np.diff(losses) / (losses[0] - losses[1:]))
 
   n = len(measurements)
   fig, axes = plt.subplots(n + 1, 1, figsize=(8, 5 * n))

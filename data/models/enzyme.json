@@ -1,0 +1,49 @@
+{
+  "states": ["A", "B", "C", "D"],
+  "parameters": {
+    "log_k0_cat":  [3.0, 8.0],
+    "Q10_cat":     [1.1, 3.0],
+    "log_K0_A":    [-3.0, 2.0],
+    "Q10_A":       [1.05, 2.5],
+    "log_K0_B":    [-3.0, 2.0],
+    "Q10_B":       [1.05, 2.5],
+    "log_K0i_C":   [-2.0, 3.0],
+    "Q10_C":       [1.05, 2.5],
+    "log_K0i_D":   [-2.0, 3.0],
+    "Q10_D":       [1.05, 2.5],
+    "delta_H":     [20000.0, 80000.0],
+    "delta_C":     [100.0, 2000.0],
+    "T_melting":   [40.0, 65.0]
+  },
+  "initial_state": {
+    "A": "A0",
+    "B": "B0",
+    "C": "0",
+    "D": "0"
+  },
+  "algebraics": {
+    "T_K":      "T + 273.15",
+    "Tm_K":     "T_melting + 273.15",
+    "vH_scale": "(1/273.15 - 1/(T + 273.15)) / (1/273.15 - 1/283.15)",
+    "K_A":      "exp(log_K0_A  + log(Q10_A)   * vH_scale)",
+    "K_B":      "exp(log_K0_B  + log(Q10_B)   * vH_scale)",
+    "Ki_C":     "exp(log_K0i_C + log(Q10_C)   * vH_scale)",
+    "Ki_D":     "exp(log_K0i_D + log(Q10_D)   * vH_scale)",
+    "kcat":     "exp(log_k0_cat + log(Q10_cat) * vH_scale)",
+    "dG":       "delta_H * (1 - T_K / Tm_K) - delta_C * ((Tm_K - T_K) - T_K * log(Tm_K / T_K))",
+    "f_active": "1 / (1 + exp(-dG / T_K))",
+    "E_active": "f_active * E0",
+    "Kapp_A":   "K_A * (1 + C / Ki_C)",
+    "Kapp_B":   "K_B * (1 + D / Ki_D)",
+    "rate":     "E_active * kcat * A / (Kapp_A + A) * B / (Kapp_B + B)"
+  },
+  "rhs": {
+    "A": "-rate",
+    "B": "-rate",
+    "C":  "rate",
+    "D":  "rate"
+  },
+  "observables": {
+    "A": "A"
+  }
+}

@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any, Dict
 
 from mcp_contracts import (
-    Condition,
     EstimateDoeParametersResponse,
     ProposeDoeExperimentsResponse,
 )
@@ -58,12 +57,6 @@ def _estimate_payload() -> Dict[str, Any]:
 def _propose_payload() -> Dict[str, Any]:
     return {
         "model_spec": _dynamic_model_spec(),
-        "condition_ranges": {
-            "A": [0.1, 5.0],
-            "B": [0.1, 5.0],
-            "E": [0.1, 5.0],
-            "temperature": [0.0, 100.0],
-        },
         "parameters": {
             "q": 818.4,
             "K_A": 0.42,
@@ -78,10 +71,13 @@ def _propose_payload() -> Dict[str, Any]:
                 "experiment 1": [3.0, 6.0, 9.0],
                 "experiment 2": [3.0, 6.0, 9.0],
             },
+            "measurements": {
+                "experiment 1": [0.5, 0.4, 0.3],
+                "experiment 2": [0.5, 0.4, 0.3],
+            },
         },
         "proposal_config": {
             "n_proposals": 2,
-            "timestamps": [1.0, 5.0, 9.0, 13.0],
             "iterations": 8,
             "criterion": "D",
             "seed": 42,
@@ -104,18 +100,11 @@ class FakeEngine:
     def propose_experiments(self, request: Any) -> ProposeDoeExperimentsResponse:
         return ProposeDoeExperimentsResponse(
             proposed_conditions=[
-                Condition.parse_obj(
-                    {"A": 1.2, "B": 2.3, "E": 1.1, "temperature": 35.0}
-                ),
-                Condition.parse_obj(
-                    {"A": 2.2, "B": 1.3, "E": 1.6, "temperature": 55.0}
-                ),
+                {"A": 1.2, "B": 2.3, "E": 1.1, "temperature": 35.0},
+                {"A": 2.2, "B": 1.3, "E": 1.6, "temperature": 55.0},
             ],
-            encoded_proposals=[
-                [0.1, 0.2, 0.3, 0.4],
-                [0.5, 0.6, 0.7, 0.8],
-            ],
-            loss_trace=[10.0, 8.0, 7.0],
+            proposal_timestamps=[3.33, 6.67, 10.0, 13.33, 16.67, 20.0, 23.33, 26.67, 30.0],
+            expected=[[0.5, 0.4, 0.3, 0.2, 0.15, 0.12, 0.1, 0.09, 0.08]] * 2,
         )
 
 
@@ -140,8 +129,8 @@ def test_propose_response_shape_is_stable() -> None:
     assert set(response.keys()) == {"ok", "data"}
     assert set(response["data"].keys()) == {
         "proposed_conditions",
-        "encoded_proposals",
-        "loss_trace",
+        "proposal_timestamps",
+        "expected",
     }
 
 

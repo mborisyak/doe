@@ -150,11 +150,11 @@ class EstimateDoeParametersRequestPayload(TypedDict):
 class HistoryPayload(TypedDict):
     conditions: Dict[str, ConditionPayload]
     timestamps: Dict[str, List[float]]
+    measurements: Dict[str, List[float]]
 
 
 class ProposalConfigPayload(TypedDict, total=False):
     n_proposals: int
-    timestamps: List[float]
     iterations: int
     criterion: str
     regularization: Optional[float]
@@ -163,9 +163,8 @@ class ProposalConfigPayload(TypedDict, total=False):
 
 class ProposeDoeExperimentsRequestPayload(TypedDict):
     model_spec: Required[Dict[str, Any]]
-    condition_ranges: Required[Dict[str, List[float]]]
-    parameters: Required[Dict[str, float]]
-    history: Required[HistoryPayload]
+    parameters: NotRequired[Dict[str, float]]
+    history: NotRequired[HistoryPayload]
     proposal_config: Required[ProposalConfigPayload]
 
 
@@ -308,20 +307,12 @@ class EstimateDoeParametersRequest(StrictBaseModel):
 class HistoryConfig(StrictBaseModel):
     conditions: Dict[str, Condition]
     timestamps: Dict[str, List[float]]
-
-    @validator("conditions")
-    def validate_conditions(cls, value: Dict[str, Condition]) -> Dict[str, Condition]:
-        if not value:
-            raise ValueError("history.conditions must contain at least one experiment.")
-        return value
+    measurements: Dict[str, List[float]]
 
     @validator("timestamps")
     def validate_timestamps_map(
         cls, value: Dict[str, List[float]]
     ) -> Dict[str, List[float]]:
-        if not value:
-            raise ValueError("history.timestamps must contain at least one experiment.")
-
         cleaned: Dict[str, List[float]] = {}
         for label, ts in value.items():
             if len(ts) < 2:
@@ -339,50 +330,42 @@ class HistoryConfig(StrictBaseModel):
             cleaned[label] = cleaned_ts
         return cleaned
 
+    @validator("measurements")
+    def validate_measurements_map(
+        cls, value: Dict[str, List[float]]
+    ) -> Dict[str, List[float]]:
+        return {
+            label: [_ensure_finite(f"history.measurements[{label}]", float(v)) for v in ys]
+            for label, ys in value.items()
+        }
+
     @root_validator
     def validate_alignment(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         conditions = values.get("conditions") or {}
         timestamps = values.get("timestamps") or {}
+        measurements = values.get("measurements") or {}
 
-        condition_labels = set(conditions.keys())
-        timestamp_labels = set(timestamps.keys())
-        if condition_labels != timestamp_labels:
-            missing = sorted(condition_labels - timestamp_labels)
-            extra = sorted(timestamp_labels - condition_labels)
-            details: List[str] = []
-            if missing:
-                details.append(f"missing timestamps for labels: {', '.join(missing)}")
-            if extra:
-                details.append(f"timestamps without conditions: {', '.join(extra)}")
+        labels = set(conditions.keys())
+        if labels != set(timestamps.keys()) or labels != set(measurements.keys()):
             raise ValueError(
-                f"history.conditions/history.timestamps labels mismatch ({'; '.join(details)})."
+                "history.conditions, history.timestamps, and history.measurements "
+                "must have the same set of experiment labels."
             )
+        for label in labels:
+            if len(timestamps[label]) != len(measurements[label]):
+                raise ValueError(
+                    f"history.timestamps[{label}] and history.measurements[{label}] "
+                    "must have the same length."
+                )
         return values
 
 
 class ProposalConfig(StrictBaseModel):
     n_proposals: int = Field(..., ge=1)
-    timestamps: List[float]
     iterations: int = Field(64, ge=1)
     criterion: str = "D"
     regularization: Optional[float] = None
     seed: int
-
-    @validator("timestamps")
-    def validate_timestamps(cls, value: List[float]) -> List[float]:
-        if len(value) < 2:
-            raise ValueError(
-                "proposal_config.timestamps must contain at least two values."
-            )
-        cleaned = [
-            _ensure_finite("proposal_config.timestamps", float(v)) for v in value
-        ]
-        for idx in range(1, len(cleaned)):
-            if cleaned[idx] <= cleaned[idx - 1]:
-                raise ValueError(
-                    "proposal_config.timestamps must be strictly increasing."
-                )
-        return cleaned
 
     @validator("criterion")
     def validate_criterion(cls, value: str) -> str:
@@ -399,27 +382,20 @@ class ProposalConfig(StrictBaseModel):
 
 class ProposeDoeExperimentsRequest(StrictBaseModel):
     model_spec: Dict[str, Any]
-    condition_ranges: Dict[str, List[float]]
-    parameters: Dict[str, float]
-    history: HistoryConfig
+    parameters: Optional[Dict[str, float]] = None
+    history: Optional[HistoryConfig] = None
     proposal_config: ProposalConfig
 
     @validator("model_spec")
     def validate_model_spec(cls, value: Dict[str, Any]) -> Dict[str, Any]:
         return _validate_model_spec_input(value)
 
-    @validator("condition_ranges")
-    def validate_condition_ranges(
-        cls, value: Dict[str, List[float]]
-    ) -> Dict[str, List[float]]:
-        return _validate_range_map(
-            map_name="condition_ranges",
-            value=value,
-            required_keys=REQUIRED_CONDITION_NAMES,
-        )
-
     @validator("parameters")
-    def validate_parameters(cls, value: Dict[str, float]) -> Dict[str, float]:
+    def validate_parameters(
+        cls, value: Optional[Dict[str, float]]
+    ) -> Optional[Dict[str, float]]:
+        if value is None:
+            return value
         return _validate_scalar_map(
             map_name="parameters",
             value=value,
@@ -474,8 +450,8 @@ class EstimateDoeParametersResponse(StrictBaseModel):
 
 class ProposeDoeExperimentsResponse(StrictBaseModel):
     proposed_conditions: List[Condition]
-    encoded_proposals: List[List[float]]
-    loss_trace: List[float]
+    proposal_timestamps: List[float]
+    expected: List[List[float]]
 
     @validator("proposed_conditions")
     def validate_proposed_conditions(cls, value: List[Condition]) -> List[Condition]:
@@ -483,30 +459,28 @@ class ProposeDoeExperimentsResponse(StrictBaseModel):
             raise ValueError("proposed_conditions cannot be empty.")
         return value
 
-    @validator("encoded_proposals")
-    def validate_encoded_proposals(cls, value: List[List[float]]) -> List[List[float]]:
+    @validator("proposal_timestamps")
+    def validate_proposal_timestamps(cls, value: List[float]) -> List[float]:
         if not value:
-            raise ValueError("encoded_proposals cannot be empty.")
-        cleaned: List[List[float]] = []
-        for row in value:
-            if len(row) != len(REQUIRED_CONDITION_NAMES):
-                raise ValueError("each encoded proposal must have four values.")
-            cleaned.append([_ensure_finite("encoded_proposals", float(v)) for v in row])
-        return cleaned
+            raise ValueError("proposal_timestamps cannot be empty.")
+        return [_ensure_finite("proposal_timestamps", float(v)) for v in value]
 
-    @validator("loss_trace")
-    def validate_loss_trace(cls, value: List[float]) -> List[float]:
+    @validator("expected")
+    def validate_expected(cls, value: List[List[float]]) -> List[List[float]]:
         if not value:
-            raise ValueError("loss_trace cannot be empty.")
-        return [_ensure_finite("loss_trace", float(v)) for v in value]
+            raise ValueError("expected cannot be empty.")
+        return [
+            [_ensure_finite("expected", float(v)) for v in row]
+            for row in value
+        ]
 
     @root_validator
     def validate_lengths(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         proposed = values.get("proposed_conditions") or []
-        encoded = values.get("encoded_proposals") or []
-        if len(proposed) != len(encoded):
+        expected = values.get("expected") or []
+        if len(proposed) != len(expected):
             raise ValueError(
-                "proposed_conditions and encoded_proposals must have equal length."
+                "proposed_conditions and expected must have equal length."
             )
         return values
 

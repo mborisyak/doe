@@ -27,6 +27,13 @@ DOE_ROOT = ROOT
 FIXTURES = TESTS_ROOT / "fixtures"
 
 
+def _load_condition_ranges() -> Dict[str, Any]:
+    import yaml
+    with (ROOT / "config" / "config.yaml").open() as f:
+        config = yaml.safe_load(f)
+    return config["conditions"]
+
+
 def _load_json(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as stream:
         return json.load(stream)
@@ -50,14 +57,9 @@ def _estimate_payload(
 
 def _propose_payload(conditions: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
     history_timestamps = {label: [3.0, 6.0, 9.0] for label in conditions}
+    history_measurements = {label: [0.5, 0.4, 0.3] for label in conditions}
     return {
         "model_spec": _dynamic_model_spec(),
-        "condition_ranges": {
-            "A": [0.1, 5.0],
-            "B": [0.1, 5.0],
-            "E": [0.1, 5.0],
-            "temperature": [0.0, 100.0],
-        },
         "parameters": {
             "q": 818.4,
             "K_A": 0.42,
@@ -66,10 +68,10 @@ def _propose_payload(conditions: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
         "history": {
             "conditions": conditions,
             "timestamps": history_timestamps,
+            "measurements": history_measurements,
         },
         "proposal_config": {
             "n_proposals": 2,
-            "timestamps": [1.0, 5.0, 9.0, 13.0, 17.0, 21.0, 25.0, 29.0],
             "iterations": 10,
             "criterion": "D",
             "seed": 12345,
@@ -118,11 +120,12 @@ def test_engine_propose_returns_values_in_range(
     response = engine.propose_experiments(request)
 
     assert len(response.proposed_conditions) == request.proposal_config.n_proposals
-    assert len(response.encoded_proposals) == request.proposal_config.n_proposals
-    assert np.all(np.isfinite(np.array(response.loss_trace)))
+    assert len(response.expected) == request.proposal_config.n_proposals
+    assert len(response.proposal_timestamps) > 0
+    condition_ranges = _load_condition_ranges()
     for condition in response.proposed_conditions:
         for field_name in REQUIRED_CONDITION_NAMES:
-            low, high = request.condition_ranges[field_name]
+            low, high = condition_ranges[field_name]
             value = float(getattr(condition, field_name))
             assert low <= value <= high
 
@@ -137,8 +140,8 @@ def test_engine_propose_is_deterministic_for_seed(
     response_one = engine.propose_experiments(request)
     response_two = engine.propose_experiments(request)
 
-    assert np.allclose(response_one.encoded_proposals, response_two.encoded_proposals)
-    assert np.allclose(response_one.loss_trace, response_two.loss_trace)
+    for c1, c2 in zip(response_one.proposed_conditions, response_two.proposed_conditions):
+        assert c1.dict() == c2.dict()
 
 
 def test_engine_rejects_empty_model_spec() -> None:
@@ -176,6 +179,54 @@ def test_engine_rejects_dynamic_model_with_invalid_spec() -> None:
         engine._create_model(model_spec)
 
     assert exc_info.value.code == "invalid_model_spec"
+
+
+def test_engine_propose_without_parameters_fits_from_history(
+    conditions_fixture: Dict[str, Dict[str, float]],
+    measurements_fixture: Dict[str, Dict[str, Any]],
+) -> None:
+    engine = DoeEngine()
+    payload = _propose_payload(conditions_fixture)
+    payload.pop("parameters")
+    payload["history"]["measurements"] = {
+        label: measurements_fixture[label]["measurements"][:3]
+        for label in sorted(conditions_fixture.keys())
+    }
+    request = ProposeDoeExperimentsRequest.parse_obj(payload)
+
+    response = engine.propose_experiments(request)
+
+    assert len(response.proposed_conditions) == request.proposal_config.n_proposals
+    assert len(response.expected) == request.proposal_config.n_proposals
+
+
+def test_engine_propose_without_history_uses_range_centers(
+    conditions_fixture: Dict[str, Dict[str, float]],
+) -> None:
+    engine = DoeEngine()
+    payload = _propose_payload(conditions_fixture)
+    payload.pop("history")
+    payload.pop("parameters")
+    request = ProposeDoeExperimentsRequest.parse_obj(payload)
+
+    response = engine.propose_experiments(request)
+
+    assert len(response.proposed_conditions) == request.proposal_config.n_proposals
+    assert len(response.expected) == request.proposal_config.n_proposals
+
+
+def test_engine_propose_with_parameters_and_no_history(
+    conditions_fixture: Dict[str, Dict[str, float]],
+) -> None:
+    engine = DoeEngine()
+    payload = _propose_payload(conditions_fixture)
+    payload.pop("history")
+    request = ProposeDoeExperimentsRequest.parse_obj(payload)
+
+    response = engine.propose_experiments(request)
+
+    assert len(response.proposed_conditions) == request.proposal_config.n_proposals
+    assert len(response.expected) == request.proposal_config.n_proposals
 
 
 def test_engine_dynamic_model_estimate_runs(

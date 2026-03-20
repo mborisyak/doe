@@ -42,30 +42,31 @@ Arguments:
 import argparse
 import json
 import math
+import os
 import sys
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 
 from doe.common import Conditions
 from doe.common.custom import CustomODESystem
 from doe.doe import Fisher
+from doe.inference import maximum_likelihood_estimate
 
 
 def parse_args():
   p = argparse.ArgumentParser(description='Propose informative experiments with Fisher optimal design.')
   p.add_argument('--model', required=True, metavar='FILE',
                  help='JSON file with the CustomODESystem spec.')
-  p.add_argument('--conditions', required=True, metavar='FILE',
+  p.add_argument('--conditions', required=False, default=None, metavar='FILE',
                  help='JSON file with historical experimental conditions.')
-  p.add_argument('--data', required=True, metavar='FILE',
+  p.add_argument('--data', required=False, default=None, metavar='FILE',
                  help='JSON file with historical measurements (timestamps are used).')
-  p.add_argument('--parameters', required=True, metavar='FILE',
+  p.add_argument('--parameters', required=False, default=None, metavar='FILE',
                  help='JSON file with fitted parameter values.')
-  p.add_argument('--condition-ranges', required=True, metavar='FILE',
-                 help='JSON file with condition bounds for proposal optimisation.')
-  p.add_argument('--n', type=int, default=3, metavar='N',
-                 help='Number of new experiments to propose (default: 3).')
+  p.add_argument('--n', type=int, default=None, metavar='N',
+                 help='Number of new experiments to propose (default: config value).')
   p.add_argument('--iterations', type=int, default=64, metavar='N',
                  help='Number of Fisher optimisation steps (default: 64).')
   p.add_argument('--criterion', choices=('D', 'A'), default='D',
@@ -74,12 +75,14 @@ def parse_args():
                  help='Optional L2 regularization strength.')
   p.add_argument('--seed', type=int, default=0, metavar='SEED',
                  help='PRNG seed (default: 0).')
-  p.add_argument('--proposal-timestamps', nargs='+', type=float, default=None, metavar='T',
-                 help='Target timestamps for new experiments (defaults to first historical timeline).')
+  p.add_argument('--config', metavar='FILE', default=None,
+                 help='Path to config.yaml (default: <root>/config/config.yaml).')
   p.add_argument('--output', metavar='FILE', default=None,
                  help='Write JSON results to FILE instead of stdout.')
   p.add_argument('--plot', metavar='FILE', default=None,
                  help='Save a summary plot to FILE.')
+  p.add_argument('--device', metavar='FILE', default='cpu',
+                 help='Compilation target.')
   return p.parse_args()
 
 
@@ -133,34 +136,6 @@ def _load_parameters(path, model):
   return model.Parameters(**values)
 
 
-def _load_condition_ranges(path):
-  payload = _load_json(path, 'condition-ranges')
-  if not isinstance(payload, dict):
-    _fail('condition-ranges JSON must be an object')
-
-  missing = sorted(set(Conditions._fields) - set(payload))
-  extra = sorted(set(payload) - set(Conditions._fields))
-  if missing:
-    _fail(f'condition-ranges file is missing required fields: {missing}')
-  if extra:
-    _fail(f'condition-ranges file contains unexpected fields: {extra}')
-
-  parsed = {}
-  for name in Conditions._fields:
-    bounds = payload[name]
-    if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
-      _fail(f'condition-ranges.{name} must be a 2-element list [low, high]')
-
-    low = _validate_finite(bounds[0], f'condition-ranges.{name}[0]')
-    high = _validate_finite(bounds[1], f'condition-ranges.{name}[1]')
-    if not high > low:
-      _fail(f'condition-ranges.{name} must satisfy high > low (got {low} .. {high})')
-
-    parsed[name] = [low, high]
-
-  return Conditions(**parsed)
-
-
 def _extract_history(conditions, data):
   if not isinstance(conditions, dict) or not conditions:
     _fail('conditions JSON must be a non-empty object: label -> condition')
@@ -202,6 +177,7 @@ def _extract_history(conditions, data):
       _fail(f'data.{label} must contain "timestamps"')
 
     ts = data[label]['timestamps']
+    ys = data[label]['measurements']
     if not isinstance(ts, list) or not ts:
       _fail(f'data.{label}.timestamps must be a non-empty list')
 
@@ -210,9 +186,17 @@ def _extract_history(conditions, data):
       for i, t in enumerate(ts)
     ]
 
+    parsed_ys = [
+      _validate_finite(y, f'data.{label}.measurements[{i}]')
+      for i, y in enumerate(ys)
+    ]
+
     if n_timestamps is None:
       n_timestamps = len(parsed_ts)
     elif len(parsed_ts) != n_timestamps:
+      _fail('all historical experiments must use the same number of timestamps')
+
+    if len(parsed_ys) != n_timestamps:
       _fail('all historical experiments must use the same number of timestamps')
 
     history_timestamps.append(parsed_ts)
@@ -240,13 +224,13 @@ def _validate_history_conditions_in_ranges(history_conditions, condition_ranges)
         )
 
 
-def _plot_summary(path, loss_trace, proposals):
+def _plot_summary(path, loss_trace, proposals, ranges, expected, timestamps):
   import matplotlib.pyplot as plt
 
   n = len(proposals)
   fields = list(Conditions._fields)
 
-  fig, axes = plt.subplots(2, n, figsize=(5 * n, 8), squeeze=False)
+  fig, axes = plt.subplots(3, n, figsize=(5 * n, 8), squeeze=False)
 
   axes[0, 0].plot(loss_trace)
   axes[0, 0].set_title('Fisher loss')
@@ -256,8 +240,23 @@ def _plot_summary(path, loss_trace, proposals):
     axes[0, j].set_visible(False)
 
   for i, proposal in enumerate(proposals):
-    axes[1, i].bar(fields, [proposal[field] for field in fields])
+    normalized = []
+    for field in fields:
+      low, high = getattr(ranges, field)
+      normalized.append(
+        (proposal[field] - low) / (high - low)
+      )
+    axes[1, i].bar(fields, normalized)
     axes[1, i].set_title(f'Proposed conditions {i + 1}')
+    axes[1, i].set_ylim([0.0, 1.05])
+
+  y_min, y_max = np.min(expected), np.max(expected)
+  delta = y_max - y_min
+  y_min, y_max = y_min - 0.025 * delta, y_max + 0.025 * delta
+
+  for i, trajectory in enumerate(expected):
+    axes[2, i].plot(timestamps, trajectory)
+    axes[2, i].set_ylim([y_min, y_max])
 
   fig.tight_layout()
   fig.savefig(path)
@@ -267,36 +266,68 @@ def _plot_summary(path, loss_trace, proposals):
 def main():
   args = parse_args()
 
-  if args.n < 1:
+  if args.config is None:
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config_path = os.path.join(root, 'config', 'config.yaml')
+  else:
+    config_path = args.config
+  with open(config_path) as f:
+    import yaml
+    config = yaml.safe_load(f)
+
+  if args.n is None:
+    n_batch = config['experiment']['batch']
+  else:
+    n_batch = args.n
+
+  if n_batch < 1:
     _fail('--n must be >= 1')
   if args.iterations < 1:
     _fail('--iterations must be >= 1')
   if args.regularization is not None and args.regularization < 0:
     _fail('--regularization must be >= 0 when provided')
 
+  device, *_ = jax.devices(args.device)
+
   spec = _load_json(args.model, 'model')
-  conditions = _load_json(args.conditions, 'conditions')
-  data = _load_json(args.data, 'data')
 
-  labels, history_conditions, history_timestamps = _extract_history(conditions, data)
+  if args.conditions is None:
+    assert args.data is None, 'conditions and data must be None simultaneously'
+    conditions, data = {}, {}
+    labels, history_conditions, history_timestamps = [], [], []
+  else:
+    assert args.data is not None, 'data file must provided with condition file'
 
-  model = CustomODESystem(spec)
+    conditions = _load_json(args.conditions, 'conditions')
+    data = _load_json(args.data, 'data')
+    labels, history_conditions, history_timestamps = _extract_history(conditions, data)
+
+  model = CustomODESystem(spec, device=device)
   parameter_ranges = model.parameter_ranges()
-  parameters = _load_parameters(args.parameters, model)
+  if args.parameters is None:
+    if len(data) > 0:
+      print('Parameters are not provided, fitting')
+      _, parameters, _ = maximum_likelihood_estimate(
+        model, conditions, data, model.parameter_ranges(),
+        mode='auto', iterations=None, rtol=1.0e-3
+      )
+    else:
+      print('Parameters are not provided, data is not provided, assuming center of the ranges')
+      parameters = model.Parameters(*(
+        (low + high) / 2 for low, high in model.parameter_ranges()
+      ))
+  else:
+    parameters = _load_parameters(args.parameters, model)
   _validate_parameters_in_ranges(parameters, parameter_ranges)
 
-  condition_ranges = _load_condition_ranges(args.condition_ranges)
-  _validate_history_conditions_in_ranges(history_conditions, condition_ranges)
+  condition_ranges = Conditions(**{
+    name: config['conditions'][name]
+    for name in Conditions._fields
+  })
 
-  if args.proposal_timestamps is None:
-    proposal_timestamps = history_timestamps[0]
-  else:
-    if len(args.proposal_timestamps) == 0:
-      _fail('--proposal-timestamps must not be empty when provided')
-    proposal_timestamps = [
-      _validate_finite(t, f'proposal-timestamps[{i}]')
-      for i, t in enumerate(args.proposal_timestamps)
-    ]
+  T = config['experiment']['duration']
+  n = config['experiment']['measurements']
+  proposal_timestamps = np.linspace(0, T, num=n + 2)[1:-1]
 
   dtype = jnp.float32
   fisher = Fisher(
@@ -309,31 +340,27 @@ def main():
     criterion=args.criterion,
   )
 
-  controls = jnp.stack([
-    fisher.encode_conditions(c) for c in history_conditions
-  ], axis=0)
-
-  history_timestamps_array = jnp.array(history_timestamps, dtype=dtype)
   key = jax.random.PRNGKey(args.seed)
 
-  loss_trace, encoded = fisher.propose(
+  loss_trace, proposal = fisher.propose(
     key=key,
-    n=args.n,
-    controls=controls,
-    timestamps=history_timestamps_array,
+    n=n_batch,
+    controls=history_conditions,
+    timestamps=history_timestamps,
     parameters=parameters,
   )
 
-  encoded_proposals = [
-    [float(v) for v in row]
-    for row in encoded.tolist()
+  expected = [
+    model.solve(jax.tree.map(lambda x: x[i], proposal), proposal_timestamps, parameters)
+    for i in range(n_batch)
   ]
+  expected = [[float(y) for y in ys] for ys in expected]
 
   proposals = []
-  for row in encoded:
-    decoded = fisher.decode_conditions(row)
+  for i in range(n_batch):
+    cs = jax.tree.map(lambda x: x[i], proposal)
     as_dict = {
-      name: float(getattr(decoded, name))
+      name: float(getattr(cs, name))
       for name in Conditions._fields
     }
     proposals.append(as_dict)
@@ -342,10 +369,8 @@ def main():
     'criterion': args.criterion,
     'seed': args.seed,
     'iterations': args.iterations,
-    'n_proposals': args.n,
-    'history_labels': labels,
-    'history_timestamps': history_timestamps,
-    'proposal_timestamps': proposal_timestamps,
+    'n_proposals': n_batch,
+    'proposal_timestamps': [float(t) for t in proposal_timestamps],
     'parameters': {
       name: float(getattr(parameters, name))
       for name in model.parameters
@@ -354,13 +379,12 @@ def main():
       name: [float(v) for v in getattr(condition_ranges, name)]
       for name in Conditions._fields
     },
-    'loss_trace': [float(v) for v in loss_trace.tolist()],
-    'encoded_proposals': encoded_proposals,
     'proposals': proposals,
+    'expected': expected
   }
 
   if args.plot:
-    _plot_summary(args.plot, result['loss_trace'], proposals)
+    _plot_summary(args.plot, loss_trace, proposals, condition_ranges, expected, proposal_timestamps)
     print(f'Plot saved to {args.plot}', file=sys.stderr)
 
   output = json.dumps(result, indent=2)

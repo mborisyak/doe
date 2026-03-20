@@ -46,14 +46,9 @@ def _propose_payload(
     conditions: Dict[str, Dict[str, float]],
 ) -> Dict[str, Any]:
     history_timestamps = {label: [3.0, 6.0, 9.0] for label in conditions}
+    history_measurements = {label: [0.5, 0.4, 0.3] for label in conditions}
     return {
         "model_spec": _dynamic_model_spec(),
-        "condition_ranges": {
-            "A": [0.1, 5.0],
-            "B": [0.1, 5.0],
-            "E": [0.1, 5.0],
-            "temperature": [0.0, 100.0],
-        },
         "parameters": {
             "q": 818.4,
             "K_A": 0.42,
@@ -62,10 +57,10 @@ def _propose_payload(
         "history": {
             "conditions": deepcopy(conditions),
             "timestamps": history_timestamps,
+            "measurements": history_measurements,
         },
         "proposal_config": {
             "n_proposals": 2,
-            "timestamps": [1.0, 5.0, 9.0, 13.0],
             "iterations": 8,
             "criterion": "D",
             "seed": 42,
@@ -404,6 +399,73 @@ def test_propose_request_is_valid_when_model_spec_is_provided(
 
     parsed = ProposeDoeExperimentsRequest.parse_obj(payload)
     assert parsed.model_spec is not None
+
+
+def test_propose_request_accepts_no_parameters(
+    conditions_fixture: Dict[str, Dict[str, float]],
+) -> None:
+    payload = _propose_payload(conditions_fixture)
+    payload.pop("parameters")
+
+    parsed = ProposeDoeExperimentsRequest.parse_obj(payload)
+    assert parsed.parameters is None
+
+
+def test_propose_request_accepts_no_history(
+    conditions_fixture: Dict[str, Dict[str, float]],
+) -> None:
+    payload = _propose_payload(conditions_fixture)
+    payload.pop("history")
+
+    parsed = ProposeDoeExperimentsRequest.parse_obj(payload)
+    assert parsed.history is None
+
+
+def test_propose_request_accepts_neither_parameters_nor_history() -> None:
+    payload = {
+        "model_spec": _dynamic_model_spec(),
+        "proposal_config": {
+            "n_proposals": 1,
+            "iterations": 4,
+            "criterion": "D",
+            "seed": 0,
+        },
+    }
+
+    parsed = ProposeDoeExperimentsRequest.parse_obj(payload)
+    assert parsed.parameters is None
+    assert parsed.history is None
+
+
+def test_propose_request_rejects_history_missing_measurements(
+    conditions_fixture: Dict[str, Dict[str, float]],
+) -> None:
+    payload = _propose_payload(conditions_fixture)
+    payload["history"].pop("measurements")
+
+    with pytest.raises(ValidationError):
+        ProposeDoeExperimentsRequest.parse_obj(payload)
+
+
+def test_propose_request_rejects_history_measurement_length_mismatch(
+    conditions_fixture: Dict[str, Dict[str, float]],
+) -> None:
+    payload = _propose_payload(conditions_fixture)
+    first_label = next(iter(payload["history"]["measurements"]))
+    payload["history"]["measurements"][first_label] = [0.5, 0.4]  # timestamps has 3
+
+    with pytest.raises(ValidationError):
+        ProposeDoeExperimentsRequest.parse_obj(payload)
+
+
+def test_propose_request_rejects_history_label_mismatch(
+    conditions_fixture: Dict[str, Dict[str, float]],
+) -> None:
+    payload = _propose_payload(conditions_fixture)
+    payload["history"]["measurements"]["extra_label"] = [0.5, 0.4, 0.3]
+
+    with pytest.raises(ValidationError):
+        ProposeDoeExperimentsRequest.parse_obj(payload)
 
 
 def test_estimate_response_accepts_dynamic_parameter_names() -> None:

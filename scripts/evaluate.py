@@ -14,6 +14,8 @@ import jax
 from jax import config; config.update("jax_enable_x64", False); config.update('jax_platform_name', 'cpu')
 import jax.numpy as jnp
 
+from tqdm import tqdm
+
 from doe.common import Conditions
 from doe.common.custom import CustomODESystem
 
@@ -47,25 +49,33 @@ def parse_args():
                  help='Write JSON results to FILE instead of stdout.')
   p.add_argument('--cores', metavar='FILE', default=None, type=int,
                  help='Number of cores for evaluation, used if parameters are not provided.')
+  p.add_argument('--plot', metavar='FILE', default=None, type=int,
+                 help='plots 9 worst test cases.')
   return p.parse_args()
 
-def solve(arguments):
+def solve(arguments, progress=False):
   spec, params, conditions, timestamps, dtype = arguments
 
   model = CustomODESystem(spec)
   params = model.Parameters(**{k: jnp.array(v, dtype=dtype) for k, v in params.items()})
 
-  _solve = jax.jit(model.solve)
+  _solve = jax.jit(model.solve_euler)
+  # cpu, *_ = jax.devices('cpu')
+  # _solve = lambda args, **kwargs: model.solve_scipy(args, **kwargs, device=cpu)
 
-  result = []
+  result, errors = [], []
 
-  for label, condition in conditions.items():
+  progress_bar = tqdm if progress else (lambda x: x)
+
+  for label, condition in progress_bar(conditions.items()):
     condition = Conditions(**{k: jnp.array(v, dtype=dtype) for k, v in conditions[label].items()})
-    trajectory = _solve(condition, timestamps=timestamps[label], parameters=params)
+    trajectory, error = _solve(condition, timestamps=timestamps[label], parameters=params)
     result.append(trajectory)
+    errors.append(error)
 
   result = np.stack(result, axis=0)
-  return result
+  errors = np.stack(errors, axis=0)
+  return result, errors
 
 def main():
   args = parse_args()
@@ -87,7 +97,7 @@ def main():
 
   else:
     with open(args.parameters, 'r') as f:
-      estimation = json.load(f)
+      estimation = json.load(f)['parameters']
       parameters = [estimation]
 
   with open(args.conditions, 'r') as f:
@@ -112,17 +122,30 @@ def main():
     for label in data
   }
 
+  test_label, *_ = conditions
+  model = CustomODESystem(spec)
+  test_conditions = Conditions(**{k: jnp.array(v, dtype=dtype) for k, v in conditions[test_label].items()})
+  params = model.Parameters(**parameters[0])
+  rhs = model.rhs(model.initial_state(test_conditions), test_conditions, params)
+
   if len(parameters) > 1:
     context = mp.get_context('spawn')
     pool = context.Pool(processes=args.cores, )
-    predictions = pool.map(
+    evaluated = pool.map(
       solve, (
         (spec, params, conditions, timestamps, dtype)
         for params in parameters
       )
     )
+    predictions, errors = zip(*evaluated)
   else:
-    predictions = [solve(spec, params, conditions, timestamps, dtype) for params in parameters]
+    predictions, errors = zip(*[
+      solve((spec, params, conditions, timestamps, dtype), progress=True)
+      for params in parameters
+    ])
+
+  if np.max(errors) > 1.0e-3:
+    print(f'WARNING: integration error {np.max(errors):.3}')
 
   predictions = np.stack(predictions, axis=0)
   measurements = np.stack([
@@ -158,6 +181,32 @@ def main():
   for i, k in enumerate(Conditions._fields):
     print(f'  {k}: {importance[i]:.2f}')
 
+  worst_index = np.argsort(mse_per_experiment)[-9:]
+  labels = [label for label in conditions]
+
+  import matplotlib.pyplot as plt
+  fig = plt.figure(figsize=(15, 15))
+  axes = fig.subplots(3, 3).ravel()
+
+  for i in range(9):
+    k = worst_index[i]
+    label = labels[k]
+    T = np.max(timestamps[label])
+    ts = np.linspace(0, T, num=1024)
+    pred, _ = zip(*[
+      solve((spec, params, {label: conditions[label]}, {label: ts}, dtype), progress=False)
+      for params in parameters
+    ])
+    pred = np.stack(pred, axis=0)
+
+    axes[i].scatter(timestamps[label], measurements[k])
+    axes[i].plot(ts, pred[:, 0].T)
+    conditions_string = ', '.join(f'{f} = {conditions[label][f]:.2f}' for f in Conditions._fields)
+    axes[i].set_title(f'{label}\n{conditions_string}')
+
+  fig.tight_layout()
+  fig.savefig('test.png')
+  plt.close(fig)
 
 if __name__ == '__main__':
   main()

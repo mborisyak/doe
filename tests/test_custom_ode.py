@@ -43,7 +43,7 @@ def test_custom_ode(plot_root, seed):
   print(ds_dt)
   assert jnp.allclose(ds_dt, jnp.array([-0.25, -0.25, 0.0]))
 
-  trajectory = model.solve(conditions, jnp.linspace(0, 1, num=10), parameters)
+  trajectory = model.solve_euler(conditions, jnp.linspace(0, 1, num=10), parameters)
 
   # estimate parameters from existing data
   _, parameters, _ = doe.inference.maximum_likelihood_estimate(

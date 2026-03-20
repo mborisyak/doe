@@ -16,7 +16,6 @@ except ImportError:  # pragma: no cover
     from doe.doe.common import CustomODESystem, ODEModel
 
 from mcp_contracts import (
-    REQUIRED_CONDITION_NAMES,
     Condition,
     EstimateDoeParametersRequest,
     EstimateDoeParametersResponse,
@@ -345,41 +344,16 @@ class DoeEngine:
     ) -> ProposeDoeExperimentsResponse:
         self._create_model(request.model_spec)
 
-        ordered_labels = sorted(request.history.conditions.keys())
-        history_conditions = {
-            label: request.history.conditions[label].dict() for label in ordered_labels
-        }
-        history_data = {
-            label: {"timestamps": request.history.timestamps[label]}
-            for label in ordered_labels
-        }
-
         with tempfile.TemporaryDirectory(prefix="mcp-doe-propose-") as tmp:
             tmp_dir = Path(tmp)
             model_path = tmp_dir / "model.json"
-            conditions_path = tmp_dir / "conditions.json"
-            history_data_path = tmp_dir / "history_timestamps.json"
-            parameters_path = tmp_dir / "parameters.json"
-            condition_ranges_path = tmp_dir / "condition_ranges.json"
             output_path = tmp_dir / "result.json"
 
             self._write_json(model_path, request.model_spec)
-            self._write_json(conditions_path, history_conditions)
-            self._write_json(history_data_path, history_data)
-            self._write_json(parameters_path, {"parameters": request.parameters})
-            self._write_json(condition_ranges_path, request.condition_ranges)
 
             args = [
                 "--model",
                 str(model_path),
-                "--conditions",
-                str(conditions_path),
-                "--data",
-                str(history_data_path),
-                "--parameters",
-                str(parameters_path),
-                "--condition-ranges",
-                str(condition_ranges_path),
                 "--n",
                 str(request.proposal_config.n_proposals),
                 "--iterations",
@@ -388,11 +362,36 @@ class DoeEngine:
                 request.proposal_config.criterion,
                 "--seed",
                 str(request.proposal_config.seed),
-                "--proposal-timestamps",
-                *[str(t) for t in request.proposal_config.timestamps],
                 "--output",
                 str(output_path),
             ]
+
+            if request.history is not None:
+                ordered_labels = sorted(request.history.conditions.keys())
+                history_conditions = {
+                    label: request.history.conditions[label].dict()
+                    for label in ordered_labels
+                }
+                history_data = {
+                    label: {
+                        "timestamps": request.history.timestamps[label],
+                        "measurements": request.history.measurements[label],
+                    }
+                    for label in ordered_labels
+                }
+                conditions_path = tmp_dir / "conditions.json"
+                history_data_path = tmp_dir / "history_data.json"
+                self._write_json(conditions_path, history_conditions)
+                self._write_json(history_data_path, history_data)
+                args.extend([
+                    "--conditions", str(conditions_path),
+                    "--data", str(history_data_path),
+                ])
+
+            if request.parameters is not None:
+                parameters_path = tmp_dir / "parameters.json"
+                self._write_json(parameters_path, {"parameters": request.parameters})
+                args.extend(["--parameters", str(parameters_path)])
 
             if request.proposal_config.regularization is not None:
                 args.extend(
@@ -413,46 +412,11 @@ class DoeEngine:
                 failure_message="Failed to propose new experiments.",
             )
 
-        loss_trace = self._float_list(result.get("loss_trace"), field="loss_trace")
-
-        raw_encoded = result.get("encoded_proposals")
-        if not isinstance(raw_encoded, list) or not raw_encoded:
-            raise ToolExecutionError(
-                code="execution_failed",
-                message="Malformed script output: encoded_proposals must be a non-empty list.",
-            )
-
-        encoded_proposals: List[List[float]] = []
-        for idx, row in enumerate(raw_encoded):
-            if not isinstance(row, list) or len(row) != len(REQUIRED_CONDITION_NAMES):
-                raise ToolExecutionError(
-                    code="execution_failed",
-                    message="Malformed script output: each encoded proposal must have four values.",
-                    details={"index": idx},
-                )
-
-            try:
-                parsed_row = [float(v) for v in row]
-            except (TypeError, ValueError) as exc:
-                raise ToolExecutionError(
-                    code="execution_failed",
-                    message="Malformed script output: encoded proposal values must be numeric.",
-                    details={"index": idx},
-                ) from exc
-            _ensure_finite_values(f"encoded_proposals[{idx}]", parsed_row)
-            encoded_proposals.append(parsed_row)
-
         raw_proposals = result.get("proposals")
         if not isinstance(raw_proposals, list) or not raw_proposals:
             raise ToolExecutionError(
                 code="execution_failed",
                 message="Malformed script output: proposals must be a non-empty list.",
-            )
-
-        if len(raw_proposals) != len(encoded_proposals):
-            raise ToolExecutionError(
-                code="execution_failed",
-                message="Malformed script output: proposals and encoded_proposals lengths mismatch.",
             )
 
         proposed_conditions: List[Condition] = []
@@ -465,29 +429,39 @@ class DoeEngine:
                     message="Malformed script output: invalid proposed condition.",
                     details={"type": type(exc).__name__},
                 ) from exc
-
-            values = condition.dict()
-            _ensure_finite_values("proposed_conditions", values.values())
-
-            for field_name in REQUIRED_CONDITION_NAMES:
-                low, high = request.condition_ranges[field_name]
-                value = values[field_name]
-                if value < (low - 1.0e-8) or value > (high + 1.0e-8):
-                    raise ToolExecutionError(
-                        code="numeric_instability",
-                        message="Decoded proposal is outside configured condition ranges.",
-                        details={
-                            "field": field_name,
-                            "value": value,
-                            "low": low,
-                            "high": high,
-                        },
-                    )
-
+            _ensure_finite_values("proposed_conditions", condition.dict().values())
             proposed_conditions.append(condition)
+
+        proposal_timestamps = self._float_list(result.get("proposal_timestamps"), field="proposal_timestamps")
+
+        raw_expected = result.get("expected")
+        if not isinstance(raw_expected, list) or not raw_expected:
+            raise ToolExecutionError(
+                code="execution_failed",
+                message="Malformed script output: expected must be a non-empty list.",
+            )
+
+        expected: List[List[float]] = []
+        for idx, row in enumerate(raw_expected):
+            if not isinstance(row, list):
+                raise ToolExecutionError(
+                    code="execution_failed",
+                    message="Malformed script output: each expected trajectory must be a list.",
+                    details={"index": idx},
+                )
+            try:
+                parsed_row = [float(v) for v in row]
+            except (TypeError, ValueError) as exc:
+                raise ToolExecutionError(
+                    code="execution_failed",
+                    message="Malformed script output: expected trajectory values must be numeric.",
+                    details={"index": idx},
+                ) from exc
+            _ensure_finite_values(f"expected[{idx}]", parsed_row)
+            expected.append(parsed_row)
 
         return ProposeDoeExperimentsResponse(
             proposed_conditions=proposed_conditions,
-            encoded_proposals=encoded_proposals,
-            loss_trace=loss_trace,
+            proposal_timestamps=proposal_timestamps,
+            expected=expected,
         )

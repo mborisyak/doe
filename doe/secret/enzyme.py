@@ -7,8 +7,6 @@ ZERO_CELSIUS =  273.15
 REFERENCE_TEMPERATURE = 10.0 + ZERO_CELSIUS
 INV_TEMPERATURE_SPAN = 1 / ZERO_CELSIUS - 1 / REFERENCE_TEMPERATURE
 
-from ..common import ODEModel
-
 __all__ = [
   'kinetics',
   ''
