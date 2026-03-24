@@ -498,12 +498,6 @@ def _ensure_json_number(name: str, value: Any) -> float:
     return float(value)
 
 
-def _ensure_json_int(name: str, value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be an integer.")
-    return int(value)
-
-
 class EnzymeConditionPayload(TypedDict):
     A: float
     B: float
@@ -511,32 +505,8 @@ class EnzymeConditionPayload(TypedDict):
     temperature: float
 
 
-class TimeConfigPayload(TypedDict, total=False):
-    t_start: float
-    t_end: float
-    measurements: int
-
-
-class SolutionConcentrationsPayload(TypedDict, total=False):
-    A: float
-    B: float
-    E: float
-
-
-class UnitsMapPayload(TypedDict, total=False):
-    time: str
-    temperature: str
-    solution_volume: str
-    concentration: str
-
-
 class SimulateEnzymeDynamicsRequestPayload(TypedDict):
     conditions: Required[Dict[str, EnzymeConditionPayload]]
-    contract_version: NotRequired[str]
-    time: NotRequired[TimeConfigPayload]
-    solutions: NotRequired[SolutionConcentrationsPayload]
-    device: NotRequired[str]
-    units: NotRequired[UnitsMapPayload]
 
 
 class EnzymeCondition(BaseModel):
@@ -562,80 +532,11 @@ class EnzymeCondition(BaseModel):
         return _ensure_finite("temperature", value)
 
 
-class TimeConfig(BaseModel):
-    t_start: float = Field(0.0, description="Start time in seconds.")
-    t_end: float = Field(30.0, description="End time in seconds.")
-    measurements: int = Field(10, description="Number of measurement points.")
-
-    class Config:
-        extra = "forbid"
-
-    @validator("t_start", "t_end", pre=True)
-    def validate_finite_times(cls, value: float, field: Any) -> float:
-        value = _ensure_json_number(field.name, value)
-        return _ensure_finite(field.name, value)
-
-    @validator("measurements", pre=True)
-    def validate_measurements(cls, value: int) -> int:
-        value = _ensure_json_int("measurements", value)
-        if value <= 1:
-            raise ValueError("measurements must be greater than 1.")
-        return value
-
-    @root_validator
-    def validate_time_window(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        t_start = values.get("t_start")
-        t_end = values.get("t_end")
-        if t_start is not None and t_end is not None and t_end <= t_start:
-            raise ValueError("t_end must be greater than t_start.")
-        return values
-
-
-class SolutionConcentrations(BaseModel):
-    A: float = Field(3.0, description="Concentration of A solution in mM.")
-    B: float = Field(3.0, description="Concentration of B solution in mM.")
-    E: float = Field(3.0e-3, description="Concentration of E solution in mM.")
-
-    class Config:
-        extra = "forbid"
-
-    @validator("A", "B", "E", pre=True)
-    def validate_solution_concentration(cls, value: float, field: Any) -> float:
-        value = _ensure_json_number(field.name, value)
-        value = _ensure_finite(field.name, value)
-        if value < 0.0:
-            raise ValueError(f"{field.name} concentration must be non-negative.")
-        return value
-
-
-class UnitsMap(BaseModel):
-    time: str = "s"
-    temperature: str = "C"
-    solution_volume: str = "mL"
-    concentration: str = "mM"
-
-    class Config:
-        extra = "forbid"
-
-
 class SimulateEnzymeDynamicsRequest(BaseModel):
-    contract_version: str = Field(TOOL_CONTRACT_VERSION)
     conditions: Dict[str, EnzymeCondition]
-    time: TimeConfig = Field(default_factory=TimeConfig)
-    solutions: SolutionConcentrations = Field(default_factory=SolutionConcentrations)
-    device: str = Field("cpu", description="JAX device name, e.g. cpu or gpu:0.")
-    units: UnitsMap = Field(default_factory=UnitsMap)
 
     class Config:
         extra = "forbid"
-
-    @validator("contract_version")
-    def validate_contract_version(cls, value: str) -> str:
-        if value != TOOL_CONTRACT_VERSION:
-            raise ValueError(
-                f"Unsupported contract_version '{value}'. Expected '{TOOL_CONTRACT_VERSION}'."
-            )
-        return value
 
     @validator("conditions")
     def validate_conditions(
@@ -645,43 +546,27 @@ class SimulateEnzymeDynamicsRequest(BaseModel):
             raise ValueError("conditions must contain at least one experiment.")
         return value
 
-    @validator("device", pre=True)
-    def validate_device(cls, value: str) -> str:
-        if not isinstance(value, str):
-            raise ValueError("device must be a string.")
-        if not value.strip():
-            raise ValueError("device must be a non-empty string.")
-        return value
-
 
 class ExperimentTrajectory(BaseModel):
-    time_points: List[float]
-    state_trajectories: Dict[str, List[float]]
+    timestamps: List[float]
+    A: List[float]
 
-    @validator("time_points")
-    def validate_time_points(cls, value: List[float]) -> List[float]:
+    @validator("timestamps")
+    def validate_timestamps(cls, value: List[float]) -> List[float]:
         if not value:
-            raise ValueError("time_points cannot be empty.")
-        return [_ensure_finite("time_points", float(v)) for v in value]
+            raise ValueError("timestamps cannot be empty.")
+        return [_ensure_finite("timestamps", float(v)) for v in value]
 
-    @validator("state_trajectories")
-    def validate_state_trajectories(
+    @validator("A")
+    def validate_A(
         cls,
-        value: Dict[str, List[float]],
+        value: List[float],
         values: Dict[str, Any],
-    ) -> Dict[str, List[float]]:
-        if not value:
-            raise ValueError("state_trajectories cannot be empty.")
-
-        expected = len(values.get("time_points", []))
-        cleaned: Dict[str, List[float]] = {}
-        for name, series in value.items():
-            if len(series) != expected:
-                raise ValueError(
-                    f"Length mismatch for '{name}': expected {expected}, got {len(series)}."
-                )
-            cleaned[name] = [_ensure_finite(name, float(v)) for v in series]
-        return cleaned
+    ) -> List[float]:
+        expected = len(values.get("timestamps", []))
+        if expected != len(value):
+            raise ValueError(f"Length mismatch for 'A': expected {expected}, got {len(value)}.")
+        return [_ensure_finite("A", float(v)) for v in value]
 
 
 class MetadataofRun(BaseModel):
