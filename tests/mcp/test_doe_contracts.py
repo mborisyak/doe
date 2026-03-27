@@ -171,6 +171,17 @@ def test_estimate_request_rejects_missing_model_spec_parameters(
         EstimateDoeParametersRequest.parse_obj(payload)
 
 
+def test_estimate_request_rejects_unknown_model_spec_symbol(
+    conditions_fixture: Dict[str, Dict[str, float]],
+    measurements_fixture: Dict[str, Dict[str, Any]],
+) -> None:
+    payload = _estimate_payload(conditions_fixture, measurements_fixture)
+    payload["model_spec"]["initial_state"]["A"] = "A"
+
+    with pytest.raises(ValidationError):
+        EstimateDoeParametersRequest.parse_obj(payload)
+
+
 def test_estimate_request_rejects_non_finite_value(
     conditions_fixture: Dict[str, Dict[str, float]],
     measurements_fixture: Dict[str, Dict[str, Any]],

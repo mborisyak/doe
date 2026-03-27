@@ -19,8 +19,10 @@ from mcp_contracts import (
     Condition,
     EstimateDoeParametersRequest,
     EstimateDoeParametersResponse,
+    ModelSpecValidationError,
     ProposeDoeExperimentsRequest,
     ProposeDoeExperimentsResponse,
+    validate_model_spec_payload,
 )
 from mcp_errors import ToolExecutionError
 
@@ -74,6 +76,10 @@ class DoeEngine:
     ) -> ODEModel[Any]:
         if len(model_spec) == 0:
             raise _invalid_model_spec("model_spec must be a non-empty object.")
+        try:
+            validate_model_spec_payload(model_spec)
+        except ModelSpecValidationError as exc:
+            raise _invalid_model_spec(str(exc), details=exc.details) from exc
         try:
             return CustomODESystem(model_spec)
         except Exception as exc:
@@ -295,8 +301,7 @@ class DoeEngine:
             ) from exc
         _ensure_finite_values("parameters", parameters.values())
 
-        loss_trace = self._float_list(result.get("loss_trace"), field="loss_trace")
-
+        loss_trace = [round(v, 3) for v in self._float_list(result.get("loss_trace"), field="loss_trace")]
         raw_predictions = result.get("predictions")
         if not isinstance(raw_predictions, dict):
             raise ToolExecutionError(
@@ -330,7 +335,7 @@ class DoeEngine:
                     details={"label": label},
                 ) from exc
             _ensure_finite_values(f"predictions.{label}", parsed_series)
-            prediction_payload[label] = parsed_series
+            prediction_payload[label] = [round(v, 3) for v in parsed_series]
 
         return EstimateDoeParametersResponse(
             parameters=parameters,

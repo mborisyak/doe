@@ -145,7 +145,7 @@ class EnzymeCliRunner:
 
             try:
                 timestamps = [float(value) for value in timestamps_raw]
-                measurements = [float(value) for value in measurements_raw]
+                measurements = [round(float(value), 3) for value in measurements_raw]
             except (TypeError, ValueError) as exc:
                 raise ToolExecutionError(
                     code="invalid_cli_output",

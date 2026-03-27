@@ -181,6 +181,21 @@ def test_engine_rejects_dynamic_model_with_invalid_spec() -> None:
     assert exc_info.value.code == "invalid_model_spec"
 
 
+def test_engine_rejects_model_spec_with_unknown_initial_state_symbol() -> None:
+    engine = DoeEngine()
+    model_spec = _dynamic_model_spec()
+    model_spec["initial_state"]["A"] = "A"
+
+    with pytest.raises(ToolExecutionError) as exc_info:
+        engine._create_model(model_spec)
+
+    assert exc_info.value.code == "invalid_model_spec"
+    assert exc_info.value.details == {
+        "location": "model_spec.initial_state.A",
+        "unknown_symbols": ["A"],
+    }
+
+
 def test_engine_propose_without_parameters_fits_from_history(
     conditions_fixture: Dict[str, Dict[str, float]],
     measurements_fixture: Dict[str, Dict[str, Any]],
