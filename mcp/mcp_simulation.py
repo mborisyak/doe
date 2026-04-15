@@ -249,9 +249,7 @@ class EnzymeCliRunner:
             config = {
                 "experiment": {
                     "duration": float(request.time.t_end - request.time.t_start),
-                    # The wrapped CLI drops first/last points, so add one to preserve
-                    # the public contract where `measurements` is the number returned.
-                    "measurements": int(request.time.measurements + 1),
+                    "measurements": int(request.time.measurements),
                 },
                 "solutions": request.solutions.dict(),
                 "noise": model_noise_std,
