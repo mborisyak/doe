@@ -3,6 +3,7 @@
 ### fixed test dataset is in the repository.
 ### to sample parameters from provided ranges, simply omit the --parameters flag.
 
+import os
 import argparse
 import json
 import math
@@ -18,7 +19,7 @@ from tqdm import tqdm
 
 from doe.common import Conditions
 from doe.common.custom import CustomODESystem
-from doe.inference import maximum_likelihood_estimate_euler
+from doe.inference import maximum_likelihood_estimate_euler, maximum_likelihood_estimate
 
 NOISE_STD = 0.025
 
@@ -56,17 +57,16 @@ def parse_args():
                  help='JSON file with experimental conditions.')
   p.add_argument('--dtype', choices=('float32', 'float64'), default='float32',
                  help='Numeric dtype for optimisation (default: float32).')
-  p.add_argument('--output', metavar='FILE', default=None,
-                 help='Write JSON results to FILE instead of stdout.')
   p.add_argument('--cores', metavar='FILE', default=None, type=int,
                  help='Number of cores for evaluation, used if parameters are not provided.')
   p.add_argument('--plot', metavar='FILE', default=None, type=int,
-                 help='plots 9 worst test cases.')
+                 help='plots N worst and N average test cases.')
+  p.add_argument('--plot-path', metavar='FILE', default=None, help='Path for the plot of sample')
   return p.parse_args()
 
 def get_parameters(model: CustomODESystem, args):
   assert (args.train_conditions is None) == (args.train_measurements is None), \
-    'either both --train-conditions and --train-measurements are set or none'
+    'either both --train-conditions and --train-measurements must be set or both must be none'
 
   if args.parameters is not None:
     with open(args.parameters, 'r') as f:
@@ -130,7 +130,8 @@ def main():
   dtype = jnp.float64 if args.dtype == 'float64' else jnp.float32
 
   with open(args.model, 'r') as f:
-    spec = json.load(f)
+    spec_string = f.read()
+    spec = json.loads(spec_string)
 
   model = CustomODESystem(spec)
   parameters = get_parameters(model, args)
@@ -169,20 +170,29 @@ def main():
   mse = np.mean(np.square(predictions - measurements))
   rmse = np.sqrt(mse)
 
-  variance = np.var([y for label in data for y in data[label]['measurements']])
+  targets = np.array([data[label]['measurements'] for label in data])
+  variance = np.var(targets)
   r_score = 1 - mse / variance
 
   print(f'[{args.model}]')
-  print(f'test RMSE: {rmse:.2f}')
-  print(f'std labels: {np.sqrt(variance):.2f}')
-  print(f'R^2 = {r_score:.2f}')
+  print(f'test RMSE: {rmse:.3f}')
+  print(f'std labels: {np.sqrt(variance):.3f}')
+  print(f'R^2 = {r_score:.3f}')
+
+  mse_per_experiment = np.mean(np.square(predictions - measurements), axis=(1,))
+
+  index_sorted = np.argsort(mse_per_experiment)
+  for q in [80, 90, 95, 99]:
+    k = int((1 - q) * mse_per_experiment.shape[0] / 100)
+    worst = index_sorted[-k:]
+    variance = np.var(targets[worst])
+    r_score = 1 - np.mean(mse_per_experiment[worst]) / variance
+    print(f'P{q} R^2: {r_score:.3f}')
 
   C = np.stack([
     [condition[k] for k in Conditions._fields]
     for _, condition in conditions.items()
   ], axis=0)
-
-  mse_per_experiment = np.mean(np.square(predictions - measurements), axis=(1, ))
 
   from sklearn.ensemble import GradientBoostingRegressor
 
@@ -194,28 +204,62 @@ def main():
   for i, k in enumerate(Conditions._fields):
     print(f'  {k}: {importance[i]:.2f}')
 
-  worst_index = np.argsort(mse_per_experiment)[-9:]
-  labels = [label for label in conditions]
+  if args.plot is not None:
+    name = os.path.basename(args.model)
+    if name.endswith('.json'):
+      name = name[:-len('.json')]
 
-  import matplotlib.pyplot as plt
-  fig = plt.figure(figsize=(15, 15))
-  axes = fig.subplots(3, 3).ravel()
+    if args.plot_path is None:
+      plot_path = f'{name}.png'
+    else:
+      plot_path = args.plot_path
 
-  for i in range(9):
-    k = worst_index[i]
-    label = labels[k]
-    T = np.max(timestamps[label])
-    ts = np.linspace(0, T, num=1024)
-    pred, _ = solve(spec, parameters, {label: conditions[label]}, {label: ts}, dtype)
+    labels = [label for label in conditions]
 
-    axes[i].scatter(timestamps[label], measurements[k])
-    axes[i].plot(ts, pred[0])
-    conditions_string = ', '.join(f'{f} = {conditions[label][f]:.2f}' for f in Conditions._fields)
-    axes[i].set_title(f'{label}\n{conditions_string}')
+    import matplotlib.pyplot as plt
 
-  fig.tight_layout()
-  fig.savefig('test.png')
-  plt.close(fig)
+    n_plot = int(math.sqrt(args.plot))
+
+    composite_fig = plt.figure(figsize=(10 * n_plot, 5 * n_plot), layout='constrained')
+    fig_random, fig_worst = composite_fig.subfigures(1, 2)
+    fig_random.suptitle('Random samples')
+    fig_random.set_facecolor('lightgray')
+    fig_worst.suptitle('Worst samples')
+    fig_worst.set_facecolor('lightcoral')
+
+    axes_random = fig_random.subplots(n_plot, n_plot).ravel()
+    axes_worst = fig_worst.subplots(n_plot, n_plot).ravel()
+
+    worst_index = np.argsort(mse_per_experiment)[-n_plot * n_plot:]
+    rng = np.random.default_rng(get_hashed_seed(spec_string))
+    random_index = rng.integers(low=0, high=mse_per_experiment.shape[0], size=(n_plot * n_plot))
+
+    max_A = 0.0
+
+    for kind, index, axes, fig in zip(
+        ['random', 'worst'], [random_index, worst_index], [axes_random, axes_worst], [fig_random, fig_worst]
+    ):
+      for i in range(n_plot * n_plot):
+        k = index[i]
+        label = labels[k]
+        T = np.max(timestamps[label])
+        ts = np.linspace(0, T, num=1024)
+        pred, _ = solve(spec, parameters, {label: conditions[label]}, {label: ts}, dtype)
+
+        max_A = max(np.max(pred), max_A)
+
+        axes[i].scatter(timestamps[label], measurements[k])
+        axes[i].plot(ts, pred[0])
+        conditions_string = ', '.join(f'{f} = {conditions[label][f]:.2f}' for f in Conditions._fields)
+        axes[i].set_title(f'{label} (RMSE: {np.sqrt(mse_per_experiment[k]) / NOISE_STD:.2f} $\\sigma$)\n{conditions_string}')
+
+    for i in range(n_plot * n_plot):
+      axes_random[i].set_ylim([0, max_A])
+      axes_worst[i].set_ylim([0, max_A])
+
+    composite_fig.savefig(plot_path)
+    plt.close(composite_fig)
 
 if __name__ == '__main__':
   main()
+

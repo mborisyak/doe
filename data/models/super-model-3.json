@@ -1,0 +1,29 @@
+{
+"states": ["A", "B", "E_active"],
+"parameters": {
+"kcat": [10.0, 5000.0],
+"K_A": [0.01, 5.0],
+"K_B": [0.01, 5.0],
+"Ea": [1.0, 200.0],
+"kd_ref": [0.001, 10.0],
+"Ed": [50.0, 500.0]
+},
+"initial_state": {
+"A": "A0",
+"B": "B0",
+"E_active": "E0"
+},
+"algebraics": {
+"kcat_T": "kcat * exp(-Ea / 0.008314 * (1.0 / (T + 273.15) - 1.0 / 323.15))",
+"kd_T": "kd_ref * exp(-Ed / 0.008314 * (1.0 / (T + 273.15) - 1.0 / 323.15))",
+"rate": "E_active * kcat_T * A / (K_A + A) * B / (K_B + B)"
+},
+"rhs": {
+"A": "-rate",
+"B": "-rate",
+"E_active": "-kd_T * E_active"
+},
+"observables": {
+"A": "A"
+}
+}
