@@ -146,6 +146,18 @@ def test_validation_error_is_structured() -> None:
     assert "errors" in response["error"]["details"]
 
 
+def test_invalid_model_spec_is_structured() -> None:
+    service = DoeMcpService(engine=FakeEngine())
+    bad_payload = _estimate_payload()
+    bad_payload["model_spec"]["initial_state"]["A"] = "A"
+
+    response = service.fit_parameters(bad_payload)
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_model_spec"
+    assert response["error"]["details"]["location"] == "model_spec.initial_state.A"
+
+
 def test_engine_error_is_mapped_to_error_envelope() -> None:
     class FailingEngine(FakeEngine):
         def propose_experiments(self, request: Any) -> ProposeDoeExperimentsResponse:

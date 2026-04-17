@@ -53,7 +53,7 @@ def main():
   from scipy.integrate import solve_ivp
 
   parser = argparse.ArgumentParser(description='Enzyme kinetics experiment')
-  parser.add_argument('--parameters', required=True, help='Path to the parameter file')
+  parser.add_argument('--parameters', required=False, default=None, help='Path to the parameter file')
   parser.add_argument('--seed', type=int, required=False, default=None, help='Seed for noise generation')
   parser.add_argument('--output', required=True, help='Path to the output file')
   parser.add_argument(
@@ -83,11 +83,17 @@ def main():
   else:
     config_path = args.config
 
+  if args.parameters is None:
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    parameters_path = os.path.join(root, 'config', 'parameters-123456789.yaml')
+  else:
+    parameters_path = args.parameters
+
   with open(config_path, 'r') as f:
     import yaml
     config = yaml.safe_load(f)
 
-  with open(args.parameters, 'r') as f:
+  with open(parameters_path, 'r') as f:
     import yaml
     parameters = yaml.safe_load(f)
     parameters = {

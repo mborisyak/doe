@@ -13,7 +13,6 @@ from mcp_tools import EnzymeMcpService
 
 def _simulate_payload() -> dict[str, Any]:
     return {
-        "contract_version": "1.0",
         "conditions": {"exp-1": {"A": 1.0, "B": 2.0, "E": 1.0, "temperature": 37.0}},
     }
 
@@ -27,8 +26,8 @@ class FakeRunner:
         return SimulateEnzymeDynamicsResponse(
             experiments={
                 "exp-1": ExperimentTrajectory(
-                    time_points=[1.0, 2.0],
-                    state_trajectories={"A_measured": [0.9, 0.8]},
+                    timestamps=[1.0, 2.0],
+                    A=[0.9, 0.8],
                 )
             },
             metadata=MetadataofRun(
@@ -56,8 +55,8 @@ def test_simulate_response_shape_is_stable() -> None:
         "metadata",
     }
     assert set(response["data"]["experiments"]["exp-1"].keys()) == {
-        "time_points",
-        "state_trajectories",
+        "timestamps",
+        "A",
     }
 
 

@@ -9,8 +9,10 @@ except ImportError:  # pragma: no cover
 
 from mcp_contracts import (
     EstimateDoeParametersRequest,
+    ModelSpecValidationError,
     ProposeDoeExperimentsRequest,
     SimulateEnzymeDynamicsRequest,
+    validate_model_spec_payload,
 )
 from mcp_engine import DoeEngine
 from mcp_errors import ToolExecutionError, error_response, success_response
@@ -28,10 +30,23 @@ class DoeMcpService:
     ) -> BaseModel:
         return model.parse_obj(payload)
 
+    @staticmethod
+    def _validate_raw_model_spec(payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict) or "model_spec" not in payload:
+            return
+        validate_model_spec_payload(payload["model_spec"])
+
     def fit_parameters(self, request: Dict[str, Any]) -> Dict[str, Any]:
         try:
+            self._validate_raw_model_spec(request)
             parsed = self._validate_request(request, EstimateDoeParametersRequest)
             response = self.engine.estimate_parameters(parsed)
+        except ModelSpecValidationError as exc:
+            return error_response(
+                code="invalid_model_spec",
+                message=str(exc),
+                details=exc.details,
+            )
         except ValidationError as exc:
             return error_response(
                 code="validation_error",
@@ -55,8 +70,15 @@ class DoeMcpService:
 
     def propose_doe_experiments(self, request: Dict[str, Any]) -> Dict[str, Any]:
         try:
+            self._validate_raw_model_spec(request)
             parsed = self._validate_request(request, ProposeDoeExperimentsRequest)
             response = self.engine.propose_experiments(parsed)
+        except ModelSpecValidationError as exc:
+            return error_response(
+                code="invalid_model_spec",
+                message=str(exc),
+                details=exc.details,
+            )
         except ValidationError as exc:
             return error_response(
                 code="validation_error",

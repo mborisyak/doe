@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from typing import Any, Dict, List, NotRequired, Optional, Required, Tuple
+import sympy as sp
 from typing_extensions import TypedDict
 
 try:
@@ -10,12 +11,24 @@ except ImportError:  # pragma: no cover
     from pydantic import BaseModel, Field, root_validator, validator
 
 REQUIRED_CONDITION_NAMES: Tuple[str, ...] = ("A", "B", "E", "temperature")
+MODEL_SPEC_CONDITION_SYMBOLS: Tuple[str, ...] = ("A0", "B0", "E0", "T")
 
 
 def _ensure_finite(name: str, value: float) -> float:
     if not math.isfinite(value):
         raise ValueError(f"{name} must be finite.")
     return value
+
+
+class ModelSpecValidationError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.details = details
 
 
 def _validate_key_set(
@@ -91,6 +104,181 @@ def _validate_scalar_map(
     return cleaned
 
 
+def _validate_string_name(name: Any, *, field_name: str) -> str:
+    if not isinstance(name, str) or not name:
+        raise ModelSpecValidationError(f"{field_name} must contain non-empty strings.")
+    return name
+
+
+def _validate_model_states(model_spec: Dict[str, Any]) -> Tuple[str, ...]:
+    states = model_spec.get("states")
+    if not isinstance(states, list) or not states:
+        raise ModelSpecValidationError("model_spec.states must be a non-empty list.")
+
+    cleaned_states = tuple(
+        _validate_string_name(state, field_name="model_spec.states")
+        for state in states
+    )
+    if len(set(cleaned_states)) != len(cleaned_states):
+        raise ModelSpecValidationError("model_spec.states must not contain duplicates.")
+    return cleaned_states
+
+
+def _validate_model_section(
+    model_spec: Dict[str, Any],
+    *,
+    section_name: str,
+) -> Dict[str, str]:
+    payload = model_spec.get(section_name)
+    if not isinstance(payload, dict):
+        raise ModelSpecValidationError(f"model_spec.{section_name} must be an object.")
+
+    cleaned: Dict[str, str] = {}
+    for raw_name, raw_expression in payload.items():
+        name = _validate_string_name(raw_name, field_name=f"model_spec.{section_name}")
+        if not isinstance(raw_expression, str) or not raw_expression:
+            raise ModelSpecValidationError(
+                f"model_spec.{section_name}.{name} must be a non-empty string."
+            )
+        cleaned[name] = raw_expression
+    return cleaned
+
+
+def _validate_model_spec_name_collisions(
+    *,
+    states: Tuple[str, ...],
+    parameters: Dict[str, List[float]],
+    algebraics: Dict[str, str],
+) -> None:
+    groups = {
+        "states": set(states),
+        "parameters": set(parameters),
+        "algebraics": set(algebraics),
+    }
+    for name_a, name_b in (
+        ("states", "parameters"),
+        ("states", "algebraics"),
+        ("parameters", "algebraics"),
+    ):
+        overlap = sorted(groups[name_a] & groups[name_b])
+        if overlap:
+            raise ModelSpecValidationError(
+                f"Variable name conflict between '{name_a}' and '{name_b}': {overlap}"
+            )
+
+
+def _parse_model_spec_expression(
+    *,
+    expression: str,
+    allowed_symbols: Dict[str, sp.Symbol],
+    location: str,
+) -> None:
+    try:
+        parsed = sp.parse_expr(expression, local_dict=allowed_symbols)
+    except Exception as exc:
+        raise ModelSpecValidationError(
+            f"{location} is not a valid symbolic expression.",
+            details={"location": location, "type": type(exc).__name__},
+        ) from exc
+
+    allowed_symbol_values = set(allowed_symbols.values())
+    unknown_symbols = sorted(
+        str(symbol)
+        for symbol in parsed.free_symbols
+        if symbol not in allowed_symbol_values
+    )
+    if unknown_symbols:
+        raise ModelSpecValidationError(
+            f"{location} references unknown symbols: {', '.join(unknown_symbols)}.",
+            details={"location": location, "unknown_symbols": unknown_symbols},
+        )
+
+
+def _validate_model_spec_expressions(
+    *,
+    states: Tuple[str, ...],
+    parameters: Dict[str, List[float]],
+    initial_state: Dict[str, str],
+    algebraics: Dict[str, str],
+    rhs: Dict[str, str],
+    observables: Dict[str, str],
+) -> None:
+    state_symbols = {name: sp.Symbol(name) for name in states}
+    parameter_symbols = {name: sp.Symbol(name) for name in parameters}
+    condition_symbols = {
+        name: sp.Symbol(name) for name in MODEL_SPEC_CONDITION_SYMBOLS
+    }
+
+    state_names = set(states)
+    if set(initial_state) != state_names:
+        missing = sorted(state_names - set(initial_state))
+        extra = sorted(set(initial_state) - state_names)
+        details: List[str] = []
+        if missing:
+            details.append(f"missing keys: {', '.join(missing)}")
+        if extra:
+            details.append(f"unexpected keys: {', '.join(extra)}")
+        raise ModelSpecValidationError(
+            f"model_spec.initial_state keys mismatch ({'; '.join(details)})."
+        )
+
+    if set(rhs) != state_names:
+        missing = sorted(state_names - set(rhs))
+        extra = sorted(set(rhs) - state_names)
+        details = []
+        if missing:
+            details.append(f"missing keys: {', '.join(missing)}")
+        if extra:
+            details.append(f"unexpected keys: {', '.join(extra)}")
+        raise ModelSpecValidationError(
+            f"model_spec.rhs keys mismatch ({'; '.join(details)})."
+        )
+
+    if set(observables) != {"A"}:
+        raise ModelSpecValidationError(
+            "model_spec.observables must contain exactly one key: 'A'."
+        )
+
+    for state_name, expression in initial_state.items():
+        _parse_model_spec_expression(
+            expression=expression,
+            allowed_symbols=condition_symbols,
+            location=f"model_spec.initial_state.{state_name}",
+        )
+
+    algebraic_symbols: Dict[str, sp.Symbol] = {}
+    for name, expression in algebraics.items():
+        _parse_model_spec_expression(
+            expression=expression,
+            allowed_symbols={
+                **state_symbols,
+                **condition_symbols,
+                **parameter_symbols,
+                **algebraic_symbols,
+            },
+            location=f"model_spec.algebraics.{name}",
+        )
+        algebraic_symbols[name] = sp.Symbol(name)
+
+    for state_name, expression in rhs.items():
+        _parse_model_spec_expression(
+            expression=expression,
+            allowed_symbols={
+                **state_symbols,
+                **condition_symbols,
+                **parameter_symbols,
+                **algebraic_symbols,
+            },
+            location=f"model_spec.rhs.{state_name}",
+        )
+
+    _parse_model_spec_expression(
+        expression=observables["A"],
+        allowed_symbols={**state_symbols, **parameter_symbols},
+        location="model_spec.observables.A",
+    )
+
+
 def _model_spec_parameter_names(model_spec: Dict[str, Any]) -> Tuple[str, ...]:
     parameters = model_spec.get("parameters")
     if not isinstance(parameters, dict) or not parameters:
@@ -100,20 +288,54 @@ def _model_spec_parameter_names(model_spec: Dict[str, Any]) -> Tuple[str, ...]:
 
 def _validate_model_spec_input(value: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(value, dict) or not value:
-        raise ValueError("model_spec must be a non-empty object.")
+        raise ModelSpecValidationError("model_spec must be a non-empty object.")
 
     parameters = value.get("parameters")
     if not isinstance(parameters, dict):
-        raise ValueError("model_spec.parameters must be an object.")
+        raise ModelSpecValidationError("model_spec.parameters must be an object.")
 
     cleaned_parameters = _validate_range_map(
         map_name="model_spec.parameters",
         value=parameters,
     )
 
+    states = _validate_model_states(value)
+    initial_state = _validate_model_section(value, section_name="initial_state")
+    algebraics = _validate_model_section(value, section_name="algebraics")
+    rhs = _validate_model_section(value, section_name="rhs")
+    observables = _validate_model_section(value, section_name="observables")
+
+    _validate_model_spec_name_collisions(
+        states=states,
+        parameters=cleaned_parameters,
+        algebraics=algebraics,
+    )
+    _validate_model_spec_expressions(
+        states=states,
+        parameters=cleaned_parameters,
+        initial_state=initial_state,
+        algebraics=algebraics,
+        rhs=rhs,
+        observables=observables,
+    )
+
     normalized = dict(value)
+    normalized["states"] = list(states)
     normalized["parameters"] = cleaned_parameters
+    normalized["initial_state"] = initial_state
+    normalized["algebraics"] = algebraics
+    normalized["rhs"] = rhs
+    normalized["observables"] = observables
     return normalized
+
+
+def validate_model_spec_payload(value: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return _validate_model_spec_input(value)
+    except ModelSpecValidationError:
+        raise
+    except ValueError as exc:
+        raise ModelSpecValidationError(str(exc)) from exc
 
 
 class StrictBaseModel(BaseModel):
@@ -247,7 +469,7 @@ class EstimateDoeParametersRequest(StrictBaseModel):
 
     @validator("model_spec")
     def validate_model_spec(cls, value: Dict[str, Any]) -> Dict[str, Any]:
-        return _validate_model_spec_input(value)
+        return validate_model_spec_payload(value)
 
     @validator("conditions")
     def validate_conditions(cls, value: Dict[str, Condition]) -> Dict[str, Condition]:
@@ -388,7 +610,7 @@ class ProposeDoeExperimentsRequest(StrictBaseModel):
 
     @validator("model_spec")
     def validate_model_spec(cls, value: Dict[str, Any]) -> Dict[str, Any]:
-        return _validate_model_spec_input(value)
+        return validate_model_spec_payload(value)
 
     @validator("parameters")
     def validate_parameters(
@@ -498,12 +720,6 @@ def _ensure_json_number(name: str, value: Any) -> float:
     return float(value)
 
 
-def _ensure_json_int(name: str, value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be an integer.")
-    return int(value)
-
-
 class EnzymeConditionPayload(TypedDict):
     A: float
     B: float
@@ -511,32 +727,8 @@ class EnzymeConditionPayload(TypedDict):
     temperature: float
 
 
-class TimeConfigPayload(TypedDict, total=False):
-    t_start: float
-    t_end: float
-    measurements: int
-
-
-class SolutionConcentrationsPayload(TypedDict, total=False):
-    A: float
-    B: float
-    E: float
-
-
-class UnitsMapPayload(TypedDict, total=False):
-    time: str
-    temperature: str
-    solution_volume: str
-    concentration: str
-
-
 class SimulateEnzymeDynamicsRequestPayload(TypedDict):
     conditions: Required[Dict[str, EnzymeConditionPayload]]
-    contract_version: NotRequired[str]
-    time: NotRequired[TimeConfigPayload]
-    solutions: NotRequired[SolutionConcentrationsPayload]
-    device: NotRequired[str]
-    units: NotRequired[UnitsMapPayload]
 
 
 class EnzymeCondition(BaseModel):
@@ -562,80 +754,11 @@ class EnzymeCondition(BaseModel):
         return _ensure_finite("temperature", value)
 
 
-class TimeConfig(BaseModel):
-    t_start: float = Field(0.0, description="Start time in seconds.")
-    t_end: float = Field(30.0, description="End time in seconds.")
-    measurements: int = Field(10, description="Number of measurement points.")
-
-    class Config:
-        extra = "forbid"
-
-    @validator("t_start", "t_end", pre=True)
-    def validate_finite_times(cls, value: float, field: Any) -> float:
-        value = _ensure_json_number(field.name, value)
-        return _ensure_finite(field.name, value)
-
-    @validator("measurements", pre=True)
-    def validate_measurements(cls, value: int) -> int:
-        value = _ensure_json_int("measurements", value)
-        if value <= 1:
-            raise ValueError("measurements must be greater than 1.")
-        return value
-
-    @root_validator
-    def validate_time_window(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        t_start = values.get("t_start")
-        t_end = values.get("t_end")
-        if t_start is not None and t_end is not None and t_end <= t_start:
-            raise ValueError("t_end must be greater than t_start.")
-        return values
-
-
-class SolutionConcentrations(BaseModel):
-    A: float = Field(3.0, description="Concentration of A solution in mM.")
-    B: float = Field(3.0, description="Concentration of B solution in mM.")
-    E: float = Field(3.0e-3, description="Concentration of E solution in mM.")
-
-    class Config:
-        extra = "forbid"
-
-    @validator("A", "B", "E", pre=True)
-    def validate_solution_concentration(cls, value: float, field: Any) -> float:
-        value = _ensure_json_number(field.name, value)
-        value = _ensure_finite(field.name, value)
-        if value < 0.0:
-            raise ValueError(f"{field.name} concentration must be non-negative.")
-        return value
-
-
-class UnitsMap(BaseModel):
-    time: str = "s"
-    temperature: str = "C"
-    solution_volume: str = "mL"
-    concentration: str = "mM"
-
-    class Config:
-        extra = "forbid"
-
-
 class SimulateEnzymeDynamicsRequest(BaseModel):
-    contract_version: str = Field(TOOL_CONTRACT_VERSION)
     conditions: Dict[str, EnzymeCondition]
-    time: TimeConfig = Field(default_factory=TimeConfig)
-    solutions: SolutionConcentrations = Field(default_factory=SolutionConcentrations)
-    device: str = Field("cpu", description="JAX device name, e.g. cpu or gpu:0.")
-    units: UnitsMap = Field(default_factory=UnitsMap)
 
     class Config:
         extra = "forbid"
-
-    @validator("contract_version")
-    def validate_contract_version(cls, value: str) -> str:
-        if value != TOOL_CONTRACT_VERSION:
-            raise ValueError(
-                f"Unsupported contract_version '{value}'. Expected '{TOOL_CONTRACT_VERSION}'."
-            )
-        return value
 
     @validator("conditions")
     def validate_conditions(
@@ -645,43 +768,27 @@ class SimulateEnzymeDynamicsRequest(BaseModel):
             raise ValueError("conditions must contain at least one experiment.")
         return value
 
-    @validator("device", pre=True)
-    def validate_device(cls, value: str) -> str:
-        if not isinstance(value, str):
-            raise ValueError("device must be a string.")
-        if not value.strip():
-            raise ValueError("device must be a non-empty string.")
-        return value
-
 
 class ExperimentTrajectory(BaseModel):
-    time_points: List[float]
-    state_trajectories: Dict[str, List[float]]
+    timestamps: List[float]
+    A: List[float]
 
-    @validator("time_points")
-    def validate_time_points(cls, value: List[float]) -> List[float]:
+    @validator("timestamps")
+    def validate_timestamps(cls, value: List[float]) -> List[float]:
         if not value:
-            raise ValueError("time_points cannot be empty.")
-        return [_ensure_finite("time_points", float(v)) for v in value]
+            raise ValueError("timestamps cannot be empty.")
+        return [_ensure_finite("timestamps", float(v)) for v in value]
 
-    @validator("state_trajectories")
-    def validate_state_trajectories(
+    @validator("A")
+    def validate_A(
         cls,
-        value: Dict[str, List[float]],
+        value: List[float],
         values: Dict[str, Any],
-    ) -> Dict[str, List[float]]:
-        if not value:
-            raise ValueError("state_trajectories cannot be empty.")
-
-        expected = len(values.get("time_points", []))
-        cleaned: Dict[str, List[float]] = {}
-        for name, series in value.items():
-            if len(series) != expected:
-                raise ValueError(
-                    f"Length mismatch for '{name}': expected {expected}, got {len(series)}."
-                )
-            cleaned[name] = [_ensure_finite(name, float(v)) for v in series]
-        return cleaned
+    ) -> List[float]:
+        expected = len(values.get("timestamps", []))
+        if expected != len(value):
+            raise ValueError(f"Length mismatch for 'A': expected {expected}, got {len(value)}.")
+        return [_ensure_finite("A", float(v)) for v in value]
 
 
 class MetadataofRun(BaseModel):

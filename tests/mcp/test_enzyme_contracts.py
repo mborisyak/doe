@@ -21,7 +21,7 @@ def test_simulate_request_rejects_negative_concentration_inputs() -> None:
         )
 
 
-def test_simulate_request_rejects_invalid_time_window() -> None:
+def test_simulate_request_rejects_time_field() -> None:
     with pytest.raises(ValidationError):
         SimulateEnzymeDynamicsRequest.parse_obj(
             {
@@ -31,6 +31,34 @@ def test_simulate_request_rejects_invalid_time_window() -> None:
                 "time": {"t_start": 10.0, "t_end": 10.0, "measurements": 10},
             }
         )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("solutions", {"A": 3.0, "B": 3.0, "E": 0.003}),
+        (
+            "units",
+            {
+                "concentration": "mM",
+                "temperature": "Celsius",
+                "time": "s",
+                "solution_volume": "mL",
+            },
+        ),
+        ("device", "cpu"),
+        ("contract_version", "1.0"),
+    ],
+)
+def test_simulate_request_rejects_removed_fields(field: str, value: object) -> None:
+    payload = {
+        "conditions": {
+            "exp-1": {"A": 1.0, "B": 2.0, "E": 1.0, "temperature": 37.0}
+        },
+        field: value,
+    }
+    with pytest.raises(ValidationError):
+        SimulateEnzymeDynamicsRequest.parse_obj(payload)
 
 
 def test_simulate_request_rejects_extra_fields() -> None:
