@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 import sys
 import tempfile
@@ -269,7 +270,7 @@ class EnzymeCliRunner:
                 "--config",
                 str(config_path),
                 "--device",
-                request.device,
+                os.environ.get("ENZYME_DEVICE", request.device),
             ]
             self._run_command(command)
 
