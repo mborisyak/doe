@@ -1,0 +1,27 @@
+{
+  "states": ["A", "B"],
+  "parameters": {
+    "kcat_ref": [1.0, 500.0],
+    "Ea": [10.0, 120.0],
+    "K_A": [0.01, 5.0],
+    "K_B": [0.01, 5.0],
+    "T_opt": [30.0, 80.0],
+    "sigma_T": [2.0, 30.0]
+  },
+  "initial_state": {
+    "A": "A0",
+    "B": "B0"
+  },
+  "algebraics": {
+    "kcat_arrh": "kcat_ref * exp(-Ea * 1000 / 8.314 * (1/(T + 273.15) - 1/323.15))",
+    "f_denat": "1 / (1 + exp((T - T_opt) / sigma_T))",
+    "rate": "E0 * kcat_arrh * f_denat * A / (K_A + A) * B / (K_B + B)"
+  },
+  "rhs": {
+    "A": "-rate",
+    "B": "-rate"
+  },
+  "observables": {
+    "A": "A"
+  }
+}
