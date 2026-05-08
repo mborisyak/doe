@@ -117,6 +117,7 @@ docs/source/.doctrees
 
 *.ipynb
 !examples/*.ipynb
+!experiments/*.ipynb
 
 tests/data_root/
 
