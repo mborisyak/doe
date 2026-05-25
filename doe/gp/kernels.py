@@ -14,6 +14,15 @@ def rbf(length_scale=1.0, variance=1.0):
   return k
 
 
+def rbf_ard(length_scales, variance=1.0):
+  """RBF with per-dimension length scales (ARD): length_scales is a (D,) vector."""
+  ls = jnp.asarray(length_scales)
+  def k(x1, x2):
+    sqdist = jnp.sum(((x1 - x2) / ls) ** 2)
+    return variance * jnp.exp(-0.5 * sqdist)
+  return k
+
+
 def matern52(length_scale=1.0, variance=1.0):
   def k(x1, x2):
     s = jnp.sqrt(5.0) * jnp.linalg.norm(x1 - x2) / length_scale
@@ -56,7 +65,14 @@ def product_of(*kernels):
 
 
 def gram(k, X1, X2):
-  return jax.vmap(jax.vmap(k, (None, 0)), (0, None))(X1, X2)
+  # X1: (*A, D), X2: (*B, D) → (*A, *B). Vmap over X2's leading dims (innermost),
+  # then X1's, so X1's batch axes come first in the output.
+  g = k
+  for _ in range(X2.ndim - 1):
+    g = jax.vmap(g, (None, 0))
+  for _ in range(X1.ndim - 1):
+    g = jax.vmap(g, (0, None))
+  return g(X1, X2)
 
 
 def kdiag(k, X):

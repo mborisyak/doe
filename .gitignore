@@ -131,3 +131,5 @@ release/
 
 data/run_2026_03_18_120000/
 data/session_20260318_112412/
+*.md
+*.pdf
