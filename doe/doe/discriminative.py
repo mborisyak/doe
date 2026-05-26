@@ -5,35 +5,40 @@ Goal: pick measurement batches that best resolve the sign pattern
 ``[f(x_i) > threshold]`` over a grid ``G`` of points, for a GP model of a scalar
 field ``f``. The exact expected information gain about the ``2**|G|`` sign
 pattern is intractable, so we score the *expected posterior* uncertainty over
-``G`` with cheap proxies and optimise the whole batch continuously by gradient
-descent.
+``G`` with the **marginal sign-entropy** proxy and optimise the whole batch
+continuously by gradient descent::
+
+    H_marg(m, sigma) = Sum_i H_b(Phi(m_i / sigma_i)),
+
+``m`` the threshold-centred posterior grid mean, ``sigma_i`` the per-point
+posterior standard deviation. Across the stress tests this was the proxy whose
+information-gain ordering tracked the exact entropy on both sharp and subtle
+boundaries; richer covariance-spectrum proxies (eigen / soft-rank / GP
+differential-entropy variants) did not robustly beat it and were dropped.
 
 Key fact exploited throughout: the GP posterior covariance on ``G`` after adding
 a batch ``B`` is value-independent -- only the posterior mean moves with the
-(unknown) batch outcome. So the outcome enters only through reparameterised mean
-draws ``m0 + (z @ chol(M)^T) @ A`` with fixed standard normals ``z`` (common
+(unknown) batch outcome. The outcome therefore enters only through reparameterised
+mean draws ``m0 + (z @ chol(M)^T) @ A`` with fixed standard normals ``z`` (common
 random numbers), which keeps the acquisition smooth and differentiable in ``B``.
 
-Proxies (``PROXIES`` maps name -> kind; ``m`` is the threshold-centred posterior
-mean ``E[f] - threshold`` on the grid, ``cov`` the posterior grid covariance):
+Because the proxy depends on the grid covariance only through its **diagonal**,
+the engine never forms the ``n_g x n_g`` grid covariance and never takes an
+eigendecomposition: per-point variances are built directly from ``kdiag`` minus
+the low-rank reductions, so cost and memory scale as ``O(n_g x batch_size)``.
 
-  ``marginal``        ``Sum_i H_b(Phi(m_i / sigma_i))`` -- marginal sign entropy
-  ``marginal_eigen``  marginal sign entropy in the covariance eigenbasis
-                      (decorrelated coordinates; transformed mean ``Q^T m``)
-  ``soft_rank_Mg``    effective (soft) rank of ``cov + m m^T``
-  ``modulated``       soft rank of weights ``var_k / (var_k + (Q^T m)_k^2)``
-  ``effective_rank``  effective rank of ``cov`` (mean-blind)
-
-Entropy proxies (``marginal*``) average the heuristic over the batch outcome;
-rank proxies (covariance-driven) are evaluated at the expected posterior mean.
+Batch optimisation runs entirely on-device: ``n_multi_start`` random restarts are
+optimised *in parallel* (one vmapped batch, distinct from the ``batch_size``
+experiment batch) by optax AdamW inside a jitted ``lax.scan`` of fixed length,
+projected back into the box each step; the best start is returned.
 """
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.scipy.special import ndtr
-import scipy.optimize as spopt
+import optax
 
-from ..gp.kernels import gram
+from ..gp.kernels import gram, kdiag
 
 __all__ = [
   'DiscriminativeDoE',
@@ -41,14 +46,14 @@ __all__ = [
   'PROXIES',
 ]
 
-# name -> kind. The kind tells the engine how to take the outcome-expectation.
-PROXIES = {
-  'marginal': 'marginal',
-  'marginal_eigen': 'marginal_eigen',
-  'soft_rank_Mg': 'rank_Mg',
-  'modulated': 'rank_mod',
-  'effective_rank': 'rank_eff',
-}
+# AdamW schedule for the on-device batch optimisation.
+N_STEPS = 200
+LR = 0.05
+N_MULTI_START = 8
+
+# Only the marginal sign-entropy proxy remains; kept as a registry so the proxy
+# name is validated and the CLI/API stay stable.
+PROXIES = {'marginal'}
 
 
 def _bits(p):
@@ -57,127 +62,108 @@ def _bits(p):
   return -(p * jnp.log(p) + (1.0 - p) * jnp.log1p(-p)) / jnp.log(2.0)
 
 
-def _effrank(eig):
-  # exp(entropy of the normalised eigenvalues): a smooth, differentiable rank.
-  eig = jnp.clip(eig, 1e-12, None)
-  p = eig / jnp.sum(eig)
-  return jnp.exp(-jnp.sum(p * jnp.log(p)))
-
-
-def _softrank(w):
-  w = jnp.clip(w, 1e-12, None)
-  p = w / jnp.sum(w)
-  return jnp.exp(-jnp.sum(p * jnp.log(p)))
-
-
-def _expected_score(kind, m0, cov_post, A, Lm, z):
-  """Expected proxy over the unknown batch outcome. ``cov_post`` is the
-  (value-independent) posterior grid covariance after conditioning on the batch;
-  ``m0`` the threshold-centred prior-to-this-step grid mean; mean draws are
-  ``m0 + (z @ Lm^T) @ A`` with fixed standard normals ``z``."""
-  cov_post = 0.5 * (cov_post + cov_post.T)
-  if kind == 'rank_eff':
-    return _effrank(jnp.linalg.eigvalsh(cov_post))
-  if kind == 'rank_Mg':
-    return _effrank(jnp.linalg.eigvalsh(cov_post + jnp.outer(m0, m0)))
-  if kind == 'rank_mod':
-    lam, Q = jnp.linalg.eigh(cov_post)
-    var = jnp.clip(lam, 0.0, None)
-    mu_rot = Q.T @ m0
-    return _softrank(var / (var + mu_rot ** 2 + 1e-12))
-  mean_draws = m0[None, :] + (z @ Lm.T) @ A                # (n_outer, n_g), centred
-  if kind == 'marginal_eigen':
-    lam, Q = jnp.linalg.eigh(cov_post)
-    sigma = jnp.sqrt(jnp.clip(lam, 1e-12, None))
-    mu_rot = mean_draws @ Q
-    return jnp.mean(jnp.sum(_bits(ndtr(mu_rot / sigma[None, :])), axis=1))
-  s = jnp.sqrt(jnp.clip(jnp.diag(cov_post), 1e-12, None))
-  return jnp.mean(jnp.sum(_bits(ndtr(mean_draws / s[None, :])), axis=1))
-
-
-def _grid_blocks(gp, state, X_grid):
-  """Grid posterior mean and covariance under the current GP (independent of any
-  future batch). Handles the zero-data (prior) state."""
+def _grid_prior(gp, state, X_grid):
+  """Grid posterior MEAN and per-point VARIANCE (the diagonal of the grid
+  covariance) under the current GP -- the full ``n_g x n_g`` covariance is never
+  formed. Also returns ``vg = L^-1 K(train, grid)`` (``N x n_g``, used for the
+  batch conditioning), or ``None`` at the zero-data prior."""
   k = gp.kernel
-  K_gg = gram(k, X_grid, X_grid)
+  var_g = kdiag(k, X_grid)                                  # (n_g,) prior diagonal
   if state.X_flat.shape[0] > 0:
-    K_tg = gram(k, state.X_flat, X_grid)
-    vg = jax.scipy.linalg.solve_triangular(state.L, K_tg, lower=True)
-    mean_g = K_tg.T @ state.alpha
-    S_gg = K_gg - vg.T @ vg
-    return mean_g, S_gg, vg
-  return jnp.zeros(X_grid.shape[0]), K_gg, None
+    K_tg = gram(k, state.X_flat, X_grid)                    # (N, n_g)
+    vg = jax.scipy.linalg.solve_triangular(state.L, K_tg, lower=True)   # (N, n_g)
+    mean_g = K_tg.T @ state.alpha                           # (n_g,)
+    var_g = var_g - jnp.sum(vg ** 2, axis=0)                # (n_g,) posterior diagonal
+    return mean_g, var_g, vg
+  return jnp.zeros(X_grid.shape[0]), var_g, None
 
 
 def optimize_batch(gp, state, X_grid, threshold, batch_size, bounds, key,
-                   proxy='marginal', n_outer=24, n_restarts=4, noise=None):
+                   proxy='marginal', *, n_outer=24, n_multi_start=N_MULTI_START,
+                   n_steps=N_STEPS, lr=LR, noise=None):
   """Continuously optimise a whole batch ``B`` (``batch_size`` x dim) over the box
   ``bounds`` (list of ``(lo, hi)`` per input dim) to MAXIMISE the expected
-  information gain of ``proxy`` about the grid sign pattern, via multi-start
-  L-BFGS-B with JAX gradients.
+  marginal-sign-entropy information gain about the grid sign pattern.
 
-  Returns ``(B, eig)``: the chosen batch and ``score_prior - min_score``
-  (bits for entropy proxies, soft-rank units for rank proxies)."""
-  kind = PROXIES[proxy]
+  All ``n_multi_start`` random restarts are optimised in parallel by optax AdamW
+  inside a jitted ``lax.scan`` of ``n_steps`` steps, each step projected back into
+  the box. Only per-point grid variances are used, so no ``n_g x n_g`` covariance
+  or eigendecomposition is ever computed. Runs on whatever device JAX is
+  configured for (GPU/CPU).
+
+  Returns ``(B, eig)``: the best batch and ``score_prior - min_score`` (bits)."""
+  if proxy not in PROXIES:
+    raise ValueError(f'unknown proxy {proxy!r}; choose from {list(PROXIES)}')
   noise = gp.noise if noise is None else noise
   dim = X_grid.shape[1]
   k = gp.kernel
   has_data = state.X_flat.shape[0] > 0
 
-  mean_g, S_gg, vg = _grid_blocks(gp, state, X_grid)
+  mean_g, var_g, vg = _grid_prior(gp, state, X_grid)
   m0 = mean_g - threshold
+  s_prior = jnp.sqrt(jnp.clip(var_g, 1e-12, None))
   z = jax.random.normal(key, (n_outer, batch_size))
-  score_prior = float(_expected_score(
-    kind, m0, S_gg, jnp.zeros((batch_size, X_grid.shape[0])),
-    jnp.eye(batch_size), jnp.zeros((n_outer, batch_size))))
+  # zero-batch score: posterior == prior, mean draws collapse to m0.
+  score_prior = float(jnp.sum(_bits(ndtr(m0 / s_prior))))
 
-  @jax.jit
-  def neg_eig(b_flat):
-    B = b_flat.reshape(batch_size, dim)
-    K_gB = gram(k, X_grid, B)
-    K_BB = gram(k, B, B)
+  lo = jnp.asarray([b[0] for b in bounds], jnp.float32)
+  hi = jnp.asarray([b[1] for b in bounds], jnp.float32)
+
+  def neg_eig(B):                                 # B: (batch_size, dim) -> scalar
+    K_gB = gram(k, X_grid, B)                     # (n_g, nb)
+    K_BB = gram(k, B, B)                          # (nb, nb)
     if has_data:
-      K_tB = gram(k, state.X_flat, B)
-      vB = jax.scipy.linalg.solve_triangular(state.L, K_tB, lower=True)
-      S_gB = K_gB - vg.T @ vB
-      S_BB = K_BB - vB.T @ vB
+      K_tB = gram(k, state.X_flat, B)             # (N, nb)
+      vB = jax.scipy.linalg.solve_triangular(state.L, K_tB, lower=True)   # (N, nb)
+      S_gB = K_gB - vg.T @ vB                     # (n_g, nb)
+      S_BB = K_BB - vB.T @ vB                     # (nb, nb)
     else:
       S_gB, S_BB = K_gB, K_BB
     M = S_BB + noise * jnp.eye(batch_size)
     Lm = jnp.linalg.cholesky(M)
-    A = jax.scipy.linalg.cho_solve((Lm, True), S_gB.T)
-    cov_post = S_gg - S_gB @ A
-    return _expected_score(kind, m0, cov_post, A, Lm, z)
+    A = jax.scipy.linalg.cho_solve((Lm, True), S_gB.T)            # (nb, n_g)
+    reduction = jnp.clip(jnp.sum(S_gB * A.T, axis=1), 0.0, None)  # (n_g,) diag only
+    s_post = jnp.sqrt(jnp.clip(var_g - reduction, 1e-12, None))   # (n_g,)
+    mean_draws = m0[None, :] + (z @ Lm.T) @ A                     # (n_outer, n_g)
+    return jnp.mean(jnp.sum(_bits(ndtr(mean_draws / s_post[None, :])), axis=1))
 
-  vng = jax.jit(jax.value_and_grad(neg_eig))
-  def fun(x):
-    v, g = vng(jnp.asarray(x, jnp.float32))
-    return float(v), np.asarray(g, np.float64)
+  vgrad = jax.value_and_grad(neg_eig)
+  # weight_decay=0: AdamW's decoupled decay would pull the design toward 0 (a box
+  # corner) and bias the result; with it off the step is scale-equivariant.
+  opt = optax.adamw(lr, weight_decay=0.0)
+  B0 = jax.random.uniform(key, (n_multi_start, batch_size, dim),
+                          minval=lo, maxval=hi)
 
-  lo = jnp.asarray([b[0] for b in bounds])
-  hi = jnp.asarray([b[1] for b in bounds])
-  sp_bounds = [bounds[d] for _ in range(batch_size) for d in range(dim)]
-  best_x, best_f = None, np.inf
-  for kk in jax.random.split(key, n_restarts):
-    b0 = jax.random.uniform(kk, (batch_size, dim), minval=lo, maxval=hi).reshape(-1)
-    res = spopt.minimize(fun, np.asarray(b0, np.float64), jac=True,
-                         method='L-BFGS-B', bounds=sp_bounds)
-    if res.fun < best_f:
-      best_f, best_x = res.fun, res.x
-  return jnp.asarray(best_x.reshape(batch_size, dim), jnp.float32), score_prior - best_f
+  @jax.jit
+  def run(B0):
+    opt_state = opt.init(B0)
+
+    def step(carry, _):
+      B, st = carry
+      _, grads = jax.vmap(vgrad)(B)               # per-start value & gradient
+      updates, st = opt.update(grads, st, B)
+      B = jnp.clip(optax.apply_updates(B, updates), lo, hi)   # project to box
+      return (B, st), None
+
+    (B_final, _), _ = jax.lax.scan(step, (B0, opt_state), None, length=n_steps)
+    return B_final, jax.vmap(neg_eig)(B_final)
+
+  B_final, final_vals = run(B0)
+  best = int(jnp.argmin(final_vals))
+  return B_final[best], score_prior - float(final_vals[best])
 
 
 class DiscriminativeDoE:
   """Discriminative DoE for a GP model of ``f``, targeting the sign pattern
-  ``[f(x) > threshold]`` over ``X_grid``.
+  ``[f(x) > threshold]`` over ``X_grid`` via the marginal sign-entropy proxy.
 
-  >>> doe = DiscriminativeDoE(gp, X_grid, threshold=0.5, proxy='marginal')
+  >>> doe = DiscriminativeDoE(gp, X_grid, threshold=0.5)
   >>> B, eig = doe.suggest(state, batch_size=8, bounds=[(0, 1), (0, 1)], key=key)
   >>> q = doe.sign_probability(state)          # P(f > threshold) on the grid
   """
 
   def __init__(self, gp, X_grid, threshold, proxy='marginal', *,
-               n_outer=24, n_restarts=4):
+               n_outer=24, n_multi_start=N_MULTI_START, n_steps=N_STEPS, lr=LR):
     if proxy not in PROXIES:
       raise ValueError(f'unknown proxy {proxy!r}; choose from {list(PROXIES)}')
     self.gp = gp
@@ -185,13 +171,16 @@ class DiscriminativeDoE:
     self.threshold = float(threshold)
     self.proxy = proxy
     self.n_outer = n_outer
-    self.n_restarts = n_restarts
+    self.n_multi_start = n_multi_start
+    self.n_steps = n_steps
+    self.lr = lr
 
   def suggest(self, state, batch_size, bounds, key):
     """Optimise and return ``(B, eig)``: the next batch and its expected info gain."""
     return optimize_batch(
       self.gp, state, self.X_grid, self.threshold, batch_size, bounds, key,
-      proxy=self.proxy, n_outer=self.n_outer, n_restarts=self.n_restarts)
+      proxy=self.proxy, n_outer=self.n_outer, n_multi_start=self.n_multi_start,
+      n_steps=self.n_steps, lr=self.lr)
 
   def sign_probability(self, state):
     """Posterior ``P(f > threshold)`` at each grid point (latent, noise-free)."""

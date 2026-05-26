@@ -24,7 +24,8 @@ def _toy(n_train=12, grid=8):
 def test_every_proxy_returns_a_valid_batch():
   gp, state, Xg, _ = _toy()
   for proxy in PROXIES:
-    doe = DiscriminativeDoE(gp, Xg, threshold=1.0, proxy=proxy, n_outer=6, n_restarts=2)
+    doe = DiscriminativeDoE(gp, Xg, threshold=1.0, proxy=proxy, n_outer=6,
+                            n_multi_start=2, n_steps=40)
     B, eig = doe.suggest(state, batch_size=3, bounds=[(0.0, 1.0), (0.0, 1.0)],
                          key=jax.random.PRNGKey(0))
     B = np.asarray(B)
@@ -49,7 +50,7 @@ def test_marginal_eig_nonnegative_from_prior():
   empty = State(X_flat=jnp.zeros((0, 2)), L=jnp.zeros((0, 0)), alpha=jnp.zeros((0,)))
   B, eig = optimize_batch(gp, empty, Xg, threshold=1.0, batch_size=3,
                           bounds=[(0.0, 1.0), (0.0, 1.0)], key=jax.random.PRNGKey(1),
-                          proxy="marginal", n_outer=8, n_restarts=2)
+                          proxy="marginal", n_outer=8, n_multi_start=2, n_steps=40)
   assert np.asarray(B).shape == (3, 2)
   assert eig >= -1e-4                                       # measuring can't increase entropy
 

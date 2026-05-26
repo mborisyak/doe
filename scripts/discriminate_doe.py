@@ -1,32 +1,35 @@
 """
 Discriminative DoE: find the (alpha, T) boundary where the full enzyme model and
-the no-inhibition ("simple") model disagree by more than a threshold.
+a reference ("simple") model disagree by more than a threshold.
 
 Design space x = (alpha, T):
     A0_vol = B0_vol = alpha/2,  E_vol = 1 - alpha   (stock volumes, total V = 1 mL)
     -> A0 = B0 = (alpha/2) * Ac,  E = (1 - alpha) * Ec   (Ac, Ec from config)
     T in [0, 100] C.
 
-Both models share one parameter file. Products C, D enter the rate ONLY through
+Both models share one parameter set. Products C, D enter the rate ONLY through
 the apparent Michaelis constants Kapp, so the simple model is the full kinetics
-evaluated with C = D = 0 (exactly the enzyme-no-inhib.json variant).
+evaluated with C = D = 0 (the enzyme-no-inhib variant).
 
 Target field (the thing the GP learns):
     f(x) = sum_i | A_full(t_i) - A_simple(t_i) |     over the measurement time grid.
-Boundary of interest: { f > threshold }, threshold = 0.1 per time-point.
-f -> 0 at both alpha extremes (no substrate / no enzyme), so the positive region
-is a closed blob -- a clean sign-discrimination test.
+Boundary of interest: { f > threshold }. f -> 0 at both alpha extremes (no
+substrate / no enzyme), so the positive region is a closed blob -- a clean
+sign-discrimination test.
 
-We run the discriminative-DoE loop (acquire batch -> measure -> refit GP) for each
-of the 5 sign-pattern entropy heuristics, starting from an UNTRAINED GP prior
-(stress test), and compare how fast each resolves the boundary.
+MULTI-RUN: instead of one fixed parameter set we sample several from the ranges in
+config/config.yaml (`parameters: name -> [lo, hi]`), run the whole discriminative-
+DoE loop (acquire batch -> measure -> refit GP) on each from an UNTRAINED GP prior,
+and summarise how fast the boundary is resolved with a median accuracy curve and a
+0.1-0.9 quantile band across the sets.
 
-Batch acquisition: greedy selection of `batch_size` points from a candidate
-sub-grid that minimise the expected posterior value of the heuristic over the
-inference grid G (32x32). The GP posterior covariance on G is value-independent
-(only the mean moves with the unknown outcome), so the entropy heuristics
-marginalise the outcome by MC over the mean draws, while the rank heuristics
-(driven by the covariance spectrum) are evaluated at the expected posterior mean.
+Batch acquisition: the whole `batch_size`-point batch is optimised continuously
+over the expected posterior marginal sign-entropy on the inference grid G,
+on-device by optax AdamW (multi-start, jitted). The GP posterior covariance on G
+is value-independent (only the mean moves with the unknown outcome), so the proxy
+marginalises the outcome by MC over the mean draws. It needs only the per-point
+grid variances (the covariance diagonal), so no n_g x n_g covariance or
+eigendecomposition is ever formed.
 """
 import os
 import json
@@ -48,21 +51,34 @@ from doe.gp import kernels
 from doe.gp.gp import GP, State
 from doe.doe.discriminative import DiscriminativeDoE
 
-LN2 = np.log(2.0)
+# normalised (alpha, T) box the batch optimiser searches over.
+BOUNDS = [(0.0, 1.0), (0.0, 1.0)]
 
-# ---------------------------------------------------------------- enzyme model
+# ---------------------------------------------------------------- config / params
 
-def load_config(root):
+def load_config(root, name="config.yaml"):
   import yaml
-  with open(os.path.join(root, "config", "enzyme.yaml")) as f:
+  with open(os.path.join(root, "config", name)) as f:
     return yaml.safe_load(f)
 
 
-def load_parameters(root):
-  with open(os.path.join(root, "data", "models", "enzyme.parameters.json")) as f:
-    raw = json.load(f)["parameters"]
-  return {k: jnp.atleast_1d(jnp.asarray(v, dtype=jnp.float32)) for k, v in raw.items()}
+def sample_parameter_sets(ranges, n_sets, rng):
+  """Sample `n_sets` parameter sets uniformly from the `name -> [lo, hi]` ranges
+  in config/config.yaml. Each set is a dict of (1,)-shaped float32 jax arrays,
+  matching what enzyme.kinetics expects."""
+  names = list(ranges)
+  sets = []
+  for _ in range(n_sets):
+    p = {}
+    for name in names:
+      lo, hi = ranges[name]
+      v = rng.uniform(float(lo), float(hi))
+      p[name] = jnp.atleast_1d(jnp.asarray(v, dtype=jnp.float32))
+    sets.append(p)
+  return sets
 
+
+# ---------------------------------------------------------------- enzyme model
 
 # Rate laws to compare the full enzyme model against. Each takes
 # (A, B, C, D, E, temp, params); the reactor RHS always supplies C = D = delta.
@@ -70,11 +86,10 @@ def _full_rate(A, B, C, D, E, T, p):
   return enzyme.kinetics(A, B, C, D, E, T, p)            # inhibition + denaturation
 
 REFERENCES = {
-  # mm: textbook Michaelis-Menten, NO inhibition and NO denaturation (the
-  # validity-region reference, doe/secret/mm.py).
+  # mm: textbook Michaelis-Menten, NO inhibition and NO denaturation.
   "mm": lambda A, B, C, D, E, T, p: mm.kinetics(A, B, C, D, E, T, p),
-  # no-inhib: enzyme kinetics with denaturation but no product inhibition
-  # (doe/secret/no_inhib.py); isolates the inhibition contribution.
+  # no-inhib: enzyme kinetics with denaturation but no product inhibition;
+  # isolates the inhibition contribution.
   "no-inhib": lambda A, B, C, D, E, T, p: no_inhib.kinetics(A, B, C, D, E, T, p),
 }
 
@@ -92,8 +107,8 @@ def build_rhs(parameters, rate_fn):
 
 
 def make_f_field(config, parameters, reference="mm"):
-  """Returns f(alpha, T) -> sum_i |A_full - A_ref| over the measurement grid,
-  where A_ref is the trajectory of the `reference` model (see REFERENCES)."""
+  """Returns (f(alpha, T) -> sum_i |A_full - A_ref|, n_meas) for one parameter
+  set, where A_ref is the trajectory of the `reference` model (see REFERENCES)."""
   dur = config["experiment"]["duration"]
   n_meas = config["experiment"]["measurements"]
   ts_eval = np.linspace(0.0, dur, num=n_meas + 2, dtype=np.float32)[1:-1]
@@ -121,23 +136,54 @@ def make_f_field(config, parameters, reference="mm"):
   return f, n_meas
 
 
-# ---------------------------------------------------------------- acquisition
-# The discriminative-DoE engine lives in the package: doe.doe.discriminative
-# (DiscriminativeDoE / optimize_batch / PROXIES). Here we only map the plot's
-# display names to the package proxy keys. (marginal - total-correlation was
-# dropped: its -1/2 logdet R term is anti-informative -- globally minimised by
-# collapsing the batch to the box corners.)
-HEURISTICS = {
-  "marginal Sum H_b": "marginal",
-  "marginal eigen": "marginal_eigen",
-  "soft-rank M_g": "soft_rank_Mg",
-  "modulated soft-rank": "modulated",
-  "effective rank": "effective_rank",
-}
-
-
 def empty_state(dim):
   return State(X_flat=jnp.zeros((0, dim)), L=jnp.zeros((0, 0)), alpha=jnp.zeros((0,)))
+
+
+# ---------------------------------------------------------------- one DoE run
+
+def run_doe_for_set(gp, Xg, ng, thr, f_field, a_lo, a_hi, pts, noise, args, set_idx):
+  """Run the full DoE loop on one parameter set from an untrained GP prior.
+  Returns a dict of per-step diagnostics (accuracy, sign-prob maps, batches)."""
+  f_true = np.array([f_field(a, T) for a, T in pts])
+  doe = DiscriminativeDoE(gp, Xg, thr, proxy="marginal", n_outer=args.n_outer,
+                          n_multi_start=args.n_multi_start, n_steps=args.n_steps,
+                          lr=args.lr)
+  rng = np.random.default_rng(args.seed + set_idx)
+  key = jax.random.PRNGKey(args.seed + set_idx)
+
+  state = empty_state(2)
+  prior_acc = doe.accuracy(state, f_true)
+  prior_q = np.asarray(doe.sign_probability(state)).reshape(ng, ng)
+
+  def measure(B_norm):
+    raw = np.column_stack([a_lo + B_norm[:, 0] * (a_hi - a_lo), B_norm[:, 1] * 100.0])
+    fv = np.array([f_field(a, T) for a, T in raw])
+    return raw, fv + np.sqrt(noise) * rng.standard_normal(fv.shape)
+
+  out = {"acc": [], "q": [], "pts": [], "batch": [], "eig": [],
+         "prior_acc": prior_acc, "prior_q": prior_q, "f_true": f_true,
+         "pos_frac": float(np.mean(f_true > thr))}
+  X_data = np.empty((0, 2)); y_data = np.empty((0,)); raw_all = np.empty((0, 2))
+  for step in range(args.steps):
+    ts = time.time()
+    key, ksel = jax.random.split(key)
+    B_norm, eig = doe.suggest(state, args.batch_size, BOUNDS, ksel)
+    B_norm = np.asarray(B_norm)
+    raw, y_new = measure(B_norm)
+    X_data = np.vstack([X_data, B_norm]); y_data = np.concatenate([y_data, y_new])
+    raw_all = np.vstack([raw_all, raw])
+    state = gp.fit(jnp.asarray(X_data, jnp.float32), jnp.asarray(y_data, jnp.float32))
+
+    acc = doe.accuracy(state, f_true)
+    out["acc"].append(acc)
+    out["q"].append(np.asarray(doe.sign_probability(state)).reshape(ng, ng))
+    out["pts"].append(raw_all.copy())                       # cumulative (raw alpha,T)
+    out["batch"].append(raw.copy())                         # this step's batch (raw)
+    out["eig"].append(eig)
+    print(f"    step {step + 1}: acc={acc:.3f}  eig={eig:.3f}  ({time.time() - ts:.1f}s)",
+          flush=True)
+  return out
 
 
 # ---------------------------------------------------------------- main
@@ -145,11 +191,15 @@ def empty_state(dim):
 def main():
   ap = argparse.ArgumentParser(description=__doc__)
   ap.add_argument("--output", default="discriminate_doe.png")
+  ap.add_argument("--config", default="config.yaml", help="config file under config/")
   ap.add_argument("--seed", type=int, default=0)
+  ap.add_argument("--n-sets", type=int, default=8, help="parameter sets sampled from config ranges")
   ap.add_argument("--grid", type=int, default=32, help="grid points per axis (inference grid G)")
   ap.add_argument("--batch-size", type=int, default=8)
   ap.add_argument("--steps", type=int, default=4)
-  ap.add_argument("--n-restarts", type=int, default=4, help="L-BFGS-B restarts for batch optimisation")
+  ap.add_argument("--n-multi-start", type=int, default=8, help="parallel AdamW restarts for batch optimisation")
+  ap.add_argument("--n-steps", type=int, default=200, help="AdamW steps per batch optimisation")
+  ap.add_argument("--lr", type=float, default=0.05, help="AdamW learning rate")
   ap.add_argument("--n-outer", type=int, default=24, help="MC draws for outcome marginalisation")
   ap.add_argument("--threshold", type=float, default=0.1, help="boundary level on summed f")
   ap.add_argument("--reference", choices=list(REFERENCES), default="mm",
@@ -162,33 +212,23 @@ def main():
   args = ap.parse_args()
 
   root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-  config = load_config(root)
-  parameters = load_parameters(root)
-  f_field, n_t = make_f_field(config, parameters, reference=args.reference)
-  thr = args.threshold                                     # boundary level on summed f
-  print(f"reference model: {args.reference}")
+  config = load_config(root, args.config)
+  thr = args.threshold                                      # boundary level on summed f
+  n_t = config["experiment"]["measurements"]
+  print(f"reference model: {args.reference}   parameter sets: {args.n_sets}")
 
-  # ---- design grid ----
+  # ---- design grid (shared across all parameter sets) ----
   ng = args.grid
   alpha = np.linspace(0.02, 0.98, ng)
   Tdeg = np.linspace(0.0, 100.0, ng)
-  AA, TT = np.meshgrid(alpha, Tdeg)                        # (ng, ng): row=T, col=alpha
-  pts = np.column_stack([AA.ravel(), TT.ravel()])          # (N, 2) raw (alpha, T)
-
-  # normalise to [0,1]^2 for the GP
+  AA, TT = np.meshgrid(alpha, Tdeg)                         # (ng, ng): row=T, col=alpha
+  pts = np.column_stack([AA.ravel(), TT.ravel()])           # (N, 2) raw (alpha, T)
   a_lo, a_hi = alpha[0], alpha[-1]
   norm_pts = np.column_stack([(pts[:, 0] - a_lo) / (a_hi - a_lo), pts[:, 1] / 100.0])
-  Xg = jnp.asarray(norm_pts, dtype=jnp.float32)
-
-  # ---- ground-truth field (secret: only for threshold check + scoring) ----
-  print(f"evaluating true f on {pts.shape[0]} grid points ...", flush=True)
-  t0 = time.time()
-  f_true = np.array([f_field(a, T) for a, T in pts])
-  print(f"  done in {time.time() - t0:.1f}s; f in [{f_true.min():.3f}, {f_true.max():.3f}], "
-        f"thr={thr}, positive fraction={np.mean(f_true > thr):.2f}", flush=True)
+  Xg = jnp.asarray(norm_pts, dtype=jnp.float32)             # normalised grid for the GP
 
   # ---- GP (ARD RBF kernel, fixed hypers throughout) ----
-  noise = (np.sqrt(n_t) * config["noise"]) ** 2           # ~ propagated measurement noise
+  noise = (np.sqrt(n_t) * config["noise"]) ** 2             # ~ propagated measurement noise
   length_scales, variance = list(args.length_scales), args.variance
   if os.path.exists(args.hypers):
     with open(args.hypers) as fh:
@@ -205,122 +245,116 @@ def main():
   kernel = kernels.rbf_ard(jnp.asarray(length_scales, jnp.float32), variance=variance)
   gp = GP(kernel, noise=noise)
 
-  def measure(B_norm, rng):
-    """Run the reactor at the continuous normalised batch; return raw (alpha,T)
-    coordinates and the noisy summed-discrepancy observations f."""
-    raw = np.column_stack([a_lo + B_norm[:, 0] * (a_hi - a_lo), B_norm[:, 1] * 100.0])
-    f = np.array([f_field(a, T) for a, T in raw])
-    return raw, f + np.sqrt(noise) * rng.standard_normal(f.shape)
+  # ---- sample parameter sets and run a DoE loop on each ----
+  param_sets = sample_parameter_sets(config["parameters"], args.n_sets,
+                                      np.random.default_rng(args.seed))
+  results = []
+  t_all = time.time()
+  for i, params in enumerate(param_sets):
+    print(f"\n=== parameter set {i + 1}/{args.n_sets} ===", flush=True)
+    t0 = time.time()
+    f_field, _ = make_f_field(config, params, reference=args.reference)
+    res = run_doe_for_set(gp, Xg, ng, thr, f_field, a_lo, a_hi, pts, noise, args, i)
+    print(f"  pos_frac={res['pos_frac']:.2f}  final acc={res['acc'][-1]:.3f}  "
+          f"({time.time() - t0:.1f}s)", flush=True)
+    results.append(res)
+  print(f"\nall sets done in {time.time() - t_all:.1f}s")
 
-  # ---- untrained-GP prior (shared cold start, before any acquisition) ----
-  bounds = [(0.0, 1.0), (0.0, 1.0)]                          # normalised (alpha, T) box
-  prior_doe = DiscriminativeDoE(gp, Xg, thr)
-  prior_acc = prior_doe.accuracy(empty_state(2), f_true)
-  prior_q = np.asarray(prior_doe.sign_probability(empty_state(2))).reshape(ng, ng)
-  print(f"prior (untrained GP): acc={prior_acc:.3f}")
+  plot(results, args, thr, AA, TT, a_lo, a_hi)
 
-  # ---- run DoE per heuristic ----
-  results = {name: {"acc": [], "q": [], "pts": [], "batch": [], "eig": []} for name in HEURISTICS}
-  for name in HEURISTICS:
-    rng = np.random.default_rng(args.seed)
-    key = jax.random.PRNGKey(args.seed)
-    doe = DiscriminativeDoE(gp, Xg, thr, proxy=HEURISTICS[name],
-                            n_outer=args.n_outer, n_restarts=args.n_restarts)
-    state = empty_state(2)
-    X_data = np.empty((0, 2)); y_data = np.empty((0,)); raw_all = np.empty((0, 2))
-    print(f"\n=== acquisition: {name} ===", flush=True)
-    for step in range(args.steps):
-      ts = time.time()
-      key, ksel = jax.random.split(key)
-      B_norm, eig = doe.suggest(state, args.batch_size, bounds, ksel)
-      B_norm = np.asarray(B_norm)
-      raw, y_new = measure(B_norm, rng)
-      X_data = np.vstack([X_data, B_norm]); y_data = np.concatenate([y_data, y_new])
-      raw_all = np.vstack([raw_all, raw])
-      state = gp.fit(jnp.asarray(X_data, jnp.float32), jnp.asarray(y_data, jnp.float32))
 
-      acc = doe.accuracy(state, f_true)
-      q = np.asarray(doe.sign_probability(state))
-      results[name]["acc"].append(acc)
-      results[name]["q"].append(q.reshape(ng, ng))
-      results[name]["pts"].append(raw_all.copy())           # cumulative (raw alpha,T)
-      results[name]["batch"].append(raw.copy())             # this step's batch (raw)
-      results[name]["eig"].append(eig)
-      print(f"  step {step + 1}: acc={acc:.3f}  eig={eig:.3f}  ({time.time() - ts:.1f}s)", flush=True)
+# ---------------------------------------------------------------- plotting
 
-  # ---- plot: acquisitions (cols) x [prior + steps] (rows), + accuracy summary ----
-  names = list(HEURISTICS)
-  nc = len(names)
+def plot(results, args, thr, AA, TT, a_lo, a_hi):
+  """Heatmap matrix (cols = parameter sets, rows = prior + steps) above a
+  full-width accuracy convergence plot with a median line and 0.1-0.9 quantile
+  band across the sets."""
+  nc = len(results)
+  ng = AA.shape[0]
+  n_heat = args.steps + 1                                   # row 0 = prior, then steps
+  N = args.steps
   extent = (a_lo, a_hi, 0.0, 100.0)
-  Ftrue = f_true.reshape(ng, ng)
   empty = np.empty((0, 2))
-  n_heat = args.steps + 1                                  # row 0 = prior, then steps
-  fig = plt.figure(figsize=(3.1 * nc, 3.0 * n_heat + 3.0))
-  gs = fig.add_gridspec(n_heat + 1, nc, height_ratios=[1] * n_heat + [1.1], hspace=0.42)
+
+  fig = plt.figure(figsize=(3.0 * nc, 2.7 * n_heat + 3.2))
+  gs = fig.add_gridspec(n_heat + 1, nc, height_ratios=[1] * n_heat + [1.4])
   heat_axes = []
 
-  def draw_cell(ax, q, earlier, batch, title):
+  def draw_cell(ax, q, Ftrue, earlier, batch, title):
     im = ax.imshow(q, origin="lower", extent=extent, aspect="auto",
                    cmap="RdBu_r", vmin=0.0, vmax=1.0)
     ax.contour(AA, TT, Ftrue, levels=[thr], colors="k", linewidths=1.5)
     ax.scatter(earlier[:, 0], earlier[:, 1], s=9, c="0.6", edgecolors="k", linewidths=0.2)
     ax.scatter(batch[:, 0], batch[:, 1], s=55, marker="*", c="yellow",
                edgecolors="k", linewidths=0.6)
-    ax.set_title(title, fontsize=9)
+    ax.set_title(title, fontsize=8)
     return im
 
-  # Each row r<N shows the GP fitted on data through step r (the *previous* GP
-  # that the acquisition saw) with batch r+1 it then selected overlaid -- so the
-  # batch is judged against the field that produced it. The final row (r==N) is
-  # the GP fitted on all data, no batch: the result.
-  N = args.steps
-  for j, name in enumerate(names):
-    q_list, b_list, p_list, a_list = (results[name]["q"], results[name]["batch"],
-                                      results[name]["pts"], results[name]["acc"])
+  # Each row r<N shows the GP fitted on data through step r (the *previous* GP the
+  # acquisition saw) with batch r+1 it then selected overlaid -- so the batch is
+  # judged against the field that produced it. The final row (r==N) is the GP
+  # fitted on all data, no batch: the result.
+  for j, res in enumerate(results):
+    Ftrue = res["f_true"].reshape(ng, ng)
     for r in range(n_heat):
       ax = fig.add_subplot(gs[r, j])
       heat_axes.append(ax)
-      field = prior_q if r == 0 else q_list[r - 1]          # GP through step r
-      acc_r = prior_acc if r == 0 else a_list[r - 1]
-      earlier = empty if r == 0 else p_list[r - 1]          # data the GP was fit on
+      field = res["prior_q"] if r == 0 else res["q"][r - 1]
+      acc_r = res["prior_acc"] if r == 0 else res["acc"][r - 1]
+      earlier = empty if r == 0 else res["pts"][r - 1]      # data the GP was fit on
       if r < N:                                             # selection context for batch r+1
-        im = draw_cell(ax, field, earlier, b_list[r], f"acc={acc_r:.3f}  ·  batch {r + 1}")
+        im = draw_cell(ax, field, Ftrue, earlier, res["batch"][r],
+                       f"acc={acc_r:.3f} · batch {r + 1}")
         row_label = f"GP after {r}\n+ batch {r + 1}"
       else:                                                 # final fit on all data, no batch
-        im = draw_cell(ax, field, earlier, empty, f"final  acc={acc_r:.3f}")
-        row_label = f"final GP\n(all data)"
+        im = draw_cell(ax, field, Ftrue, earlier, empty, f"final  acc={acc_r:.3f}")
+        row_label = "final GP\n(all data)"
       if r == 0:
-        ax.annotate(name, xy=(0.5, 1.25), xycoords="axes fraction", ha="center",
-                    fontsize=10, weight="bold")
+        ax.annotate(f"set {j + 1}  (pos {res['pos_frac']:.2f})", xy=(0.5, 1.28),
+                    xycoords="axes fraction", ha="center", fontsize=9, weight="bold")
       if j == 0:
-        ax.set_ylabel(f"{row_label}\nT (C)", fontsize=9)
+        ax.set_ylabel(f"{row_label}\nT (C)", fontsize=8)
       if r == n_heat - 1:
-        ax.set_xlabel("alpha", fontsize=9)
+        ax.set_xlabel("alpha", fontsize=8)
 
-  # full-width accuracy-vs-step summary (step 0 = shared untrained prior)
-  ax_sum = fig.add_subplot(gs[n_heat, :])
+  # ---- full-width convergence plot: median + 0.1-0.9 quantile band across sets ----
+  curves = np.array([[res["prior_acc"]] + res["acc"] for res in results])  # (n_sets, steps+1)
   xs = np.arange(0, args.steps + 1)
-  for name in names:
-    ax_sum.plot(xs, [prior_acc] + results[name]["acc"], marker="o", lw=1.8, label=name)
+  med = np.median(curves, axis=0)
+  q1, q9 = np.quantile(curves, 0.1, axis=0), np.quantile(curves, 0.9, axis=0)
+
+  ax_sum = fig.add_subplot(gs[n_heat, :])
+  for c in curves:
+    ax_sum.plot(xs, c, color="0.7", lw=0.8, alpha=0.6, zorder=1)
+  ax_sum.fill_between(xs, q1, q9, color="C0", alpha=0.25, zorder=2,
+                      label="0.1-0.9 quantile band")
+  ax_sum.plot(xs, med, color="C0", marker="o", lw=2.0, zorder=3, label="median")
   ax_sum.set_xlabel("DoE step (0 = untrained prior)")
   ax_sum.set_ylabel("point-wise accuracy\n(GP-uncertainty aware)")
   ax_sum.set_xticks(xs)
-  ax_sum.set_title("Accuracy vs step, all acquisitions")
+  ax_sum.set_title(f"Accuracy vs step across {nc} parameter sets")
   ax_sum.grid(alpha=0.3)
-  ax_sum.legend(fontsize=8, ncol=min(nc, 3), loc="lower right")
+  ax_sum.legend(fontsize=9, loc="lower right")
 
-  fig.suptitle(f"Discriminative DoE (full vs {args.reference}): rows = GP P(f > {thr}) BEFORE each "
-               "batch with the batch it selected (yellow*) overlaid; last row = final GP on all data. "
-               "black = true boundary, gray = data already used",
-               y=0.995, fontsize=11)
-  fig.colorbar(im, ax=heat_axes, shrink=0.6, label="P(f > thr)")
-  fig.savefig(args.output, dpi=130, bbox_inches="tight")
+  # two-line suptitle
+  fig.suptitle(
+    f"Discriminative DoE (full vs {args.reference}) over {nc} sampled parameter sets\n"
+    f"rows = GP P(f > {thr}) before each batch (yellow* = selected); "
+    "black = true boundary, gray = used data",
+    fontsize=11)
+
+  fig.tight_layout(rect=(0.0, 0.0, 0.93, 0.97))             # leave room for colorbar + suptitle
+  cax = fig.add_axes((0.945, 0.40, 0.012, 0.42))
+  fig.colorbar(im, cax=cax, label="P(f > thr)")
+  fig.savefig(args.output, dpi=130)
   print(f"\nsaved {args.output}")
 
-  print("\nfinal accuracy:")
-  for name in names:
-    print(f"  {name:22s} {results[name]['acc'][-1]:.3f}   "
-          f"(steps: {', '.join(f'{a:.3f}' for a in results[name]['acc'])})")
+  print("\nfinal accuracy by set:")
+  for j, res in enumerate(results):
+    print(f"  set {j + 1:2d}: {res['acc'][-1]:.3f}   "
+          f"(steps: {', '.join(f'{a:.3f}' for a in res['acc'])})")
+  print(f"median final acc = {med[-1]:.3f}  "
+        f"[q0.1={q1[-1]:.3f}, q0.9={q9[-1]:.3f}]")
 
 
 if __name__ == "__main__":
