@@ -10,5 +10,8 @@ def test_all_tools_are_exposed() -> None:
         "fit_parameters",
         "propose_doe_experiments",
         "simulate_enzyme_dynamics",
+        "store_create",
+        "store_get",
+        "store_list",
     }
 
