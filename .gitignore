@@ -135,3 +135,5 @@ data/session_20260318_112412/
 *.pdf
 
 !README.md
+!STORAGE.md
+!STORAGE_FOR_AGENTS.md
