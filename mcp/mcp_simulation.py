@@ -16,6 +16,7 @@ from mcp_contracts import (
     MetadataofRun,
     SimulateEnzymeDynamicsRequest,
     SimulateEnzymeDynamicsResponse,
+    UnitsMap,
 )
 from mcp_errors import ToolExecutionError
 
@@ -26,7 +27,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 DEFAULT_ENZYME_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PARAMETER_FILE_RELATIVE = Path("config/parameters-123456789.yaml")
-DEFAULT_MODEL_CONFIG_RELATIVE = Path("config/config.yaml")
+# Config-owned sampling window + concentrations + noise; the same file get_config exposes.
+DEFAULT_CONFIG_RELATIVE = Path("config/enzyme.yaml")
 REQUIRED_PARAMETER_NAMES: Tuple[str, ...] = (
     "log_k0_cat",
     "Q10_cat",
@@ -71,13 +73,13 @@ class EnzymeCliRunner:
         python_executable: str = sys.executable,
         timeout_seconds: int = 120,
         parameter_file_relative: Path = DEFAULT_PARAMETER_FILE_RELATIVE,
-        model_config_relative: Path = DEFAULT_MODEL_CONFIG_RELATIVE,
+        config_relative: Path = DEFAULT_CONFIG_RELATIVE,
     ) -> None:
         self.enzyme_root = enzyme_root
         self.python_executable = python_executable
         self.timeout_seconds = timeout_seconds
         self.parameter_file_relative = Path(parameter_file_relative)
-        self.model_config_relative = Path(model_config_relative)
+        self.config_relative = Path(config_relative)
         self.model_version = _read_model_version(enzyme_root)
 
     def _validate_static_parameter_file(self, parameters_path: Path) -> None:
@@ -142,48 +144,63 @@ class EnzymeCliRunner:
                     },
                 )
 
-    def _read_model_noise_std(self) -> float:
-        config_path = self.enzyme_root / self.model_config_relative
+    def _read_enzyme_config(self) -> Dict[str, object]:
+        """Read the config-owned sampling window, solution concentrations, and noise from the
+        enzyme config (the same file get_config exposes). The agent supplies none of these.
+        Returns ``{duration, measurements, solutions, noise}``."""
+        config_path = self.enzyme_root / self.config_relative
+
+        def invalid(message: str, **details: object) -> ToolExecutionError:
+            return ToolExecutionError(code="model_config_invalid", message=message,
+                                      details={"model_config": str(config_path), **details})
+
         if not config_path.exists():
             raise ToolExecutionError(
                 code="model_config_missing",
                 message="Model config file does not exist.",
                 details={"model_config": str(config_path)},
             )
-
         try:
             with config_path.open("r", encoding="utf-8") as stream:
                 payload = yaml.safe_load(stream)
         except Exception as exc:
-            raise ToolExecutionError(
-                code="model_config_invalid",
-                message="Model config file could not be parsed.",
-                details={"model_config": str(config_path), "reason": str(exc)},
-            ) from exc
+            raise invalid("Model config file could not be parsed.", reason=str(exc)) from exc
+        if not isinstance(payload, dict):
+            raise invalid("Model config file must contain a mapping.")
 
-        if not isinstance(payload, dict) or "noise" not in payload:
-            raise ToolExecutionError(
-                code="model_config_invalid",
-                message="Model config file must define a top-level 'noise' value.",
-                details={"model_config": str(config_path)},
-            )
+        experiment = payload.get("experiment")
+        if not isinstance(experiment, dict) or {"duration", "measurements"} - set(experiment):
+            raise invalid("Model config must define experiment.duration and experiment.measurements.")
+        try:
+            duration = float(experiment["duration"])
+            measurements = int(experiment["measurements"])
+        except (TypeError, ValueError) as exc:
+            raise invalid("experiment.duration must be numeric and measurements an integer.",
+                          reason=str(exc)) from exc
+        if not math.isfinite(duration) or duration <= 0.0:
+            raise invalid("experiment.duration must be a finite positive number.", value=experiment["duration"])
+        if measurements <= 1:
+            raise invalid("experiment.measurements must be greater than 1.", value=experiment["measurements"])
 
+        raw_solutions = payload.get("solutions")
+        if not isinstance(raw_solutions, dict) or {"A", "B", "E"} - set(raw_solutions):
+            raise invalid("Model config must define solutions for A, B, E.")
+        try:
+            solutions = {name: float(raw_solutions[name]) for name in ("A", "B", "E")}
+        except (TypeError, ValueError) as exc:
+            raise invalid("solution concentrations must be numeric.", reason=str(exc)) from exc
+
+        if "noise" not in payload:
+            raise invalid("Model config file must define a top-level 'noise' value.")
         try:
             noise_std = float(payload["noise"])
         except (TypeError, ValueError) as exc:
-            raise ToolExecutionError(
-                code="model_config_invalid",
-                message="Model config 'noise' must be numeric.",
-                details={"model_config": str(config_path), "value": payload["noise"]},
-            ) from exc
-
+            raise invalid("Model config 'noise' must be numeric.", value=payload["noise"]) from exc
         if not math.isfinite(noise_std) or noise_std < 0.0:
-            raise ToolExecutionError(
-                code="model_config_invalid",
-                message="Model config 'noise' must be a finite non-negative number.",
-                details={"model_config": str(config_path), "value": payload["noise"]},
-            )
-        return noise_std
+            raise invalid("Model config 'noise' must be a finite non-negative number.", value=payload["noise"])
+
+        return {"duration": duration, "measurements": measurements,
+                "solutions": solutions, "noise": noise_std}
 
     def _run_command(self, command: list[str]) -> None:
         if not self.enzyme_root.exists():
@@ -232,7 +249,9 @@ class EnzymeCliRunner:
     ) -> SimulateEnzymeDynamicsResponse:
         parameters_path = self.enzyme_root / self.parameter_file_relative
         self._validate_static_parameter_file(parameters_path)
-        model_noise_std = self._read_model_noise_std()
+        settings = self._read_enzyme_config()
+        model_noise_std = settings["noise"]
+        device = os.environ.get("ENZYME_DEVICE", "cpu")
 
         with tempfile.TemporaryDirectory(prefix="enzyme-mcp-") as temp_dir:
             work = Path(temp_dir)
@@ -249,10 +268,10 @@ class EnzymeCliRunner:
 
             config = {
                 "experiment": {
-                    "duration": float(request.time.t_end - request.time.t_start),
-                    "measurements": int(request.time.measurements),
+                    "duration": settings["duration"],
+                    "measurements": settings["measurements"],
                 },
-                "solutions": request.solutions.dict(),
+                "solutions": settings["solutions"],
                 "noise": model_noise_std,
             }
             with config_path.open("w", encoding="utf-8") as stream:
@@ -270,7 +289,7 @@ class EnzymeCliRunner:
                 "--config",
                 str(config_path),
                 "--device",
-                os.environ.get("ENZYME_DEVICE", request.device),
+                device,
             ]
             self._run_command(command)
 
@@ -292,7 +311,7 @@ class EnzymeCliRunner:
             )
 
         experiments: Dict[str, ExperimentTrajectory] = {}
-        expected_points = int(request.time.measurements)
+        expected_points = settings["measurements"]
         for label, payload in raw_results.items():
             if not isinstance(payload, dict):
                 raise ToolExecutionError(
@@ -316,9 +335,9 @@ class EnzymeCliRunner:
                 )
 
             try:
-                timestamps = [
-                    float(value) + request.time.t_start for value in timestamps_raw
-                ]
+                # The CLI integrates from t=0 and the config window starts at 0, so the
+                # returned timestamps are used as-is (no t_start shift).
+                timestamps = [float(value) for value in timestamps_raw]
                 measurements = [float(value) for value in measurements_raw]
             except (TypeError, ValueError) as exc:
                 raise ToolExecutionError(
@@ -361,10 +380,6 @@ class EnzymeCliRunner:
                 ) from exc
 
         warnings: list[str] = []
-        if request.time.t_start != 0.0:
-            warnings.append(
-                "Underlying CLI integrates from t=0; returned timestamps were shifted by t_start."
-            )
         if model_noise_std > 0.0:
             warnings.append(
                 "Noise is configured by model config and run without an explicit RNG seed."
@@ -378,17 +393,17 @@ class EnzymeCliRunner:
                 "id": "scipy.solve_ivp.LSODA",
                 "configuration": {
                     "method": "LSODA",
-                    "device": request.device,
+                    "device": device,
                 },
             },
-            units_map=request.units.dict(),
+            units_map=UnitsMap().dict(),
             warnings=warnings,
             diagnostics={
                 "transport": "cli",
                 "script": "scripts/experiment.py",
                 "enzyme_root": str(self.enzyme_root),
                 "parameter_file": str(parameters_path),
-                "model_config": str(self.enzyme_root / self.model_config_relative),
+                "model_config": str(self.enzyme_root / self.config_relative),
                 "model_noise_std": model_noise_std,
             },
             deterministic=model_noise_std == 0.0,

@@ -52,7 +52,7 @@ def test_nested_fitted_namespace(tmp_path):
     rec = s["fitted_model"]["model-x"]["v1"]         # full content, arrays included
     assert rec["name"] == "model-x/v1"
     assert rec["auxiliary"]["loss_trace"] == [0.5, 0.3, 0.27]
-    assert (tmp_path / "store" / "fitted_models" / "model-x" / "v1.json").is_file()
+    assert (tmp_path / "store" / "fitted_model" / "model-x" / "v1.json").is_file()
 
 
 def test_keys_contains_len(tmp_path):
@@ -97,10 +97,10 @@ def test_lock_mints_and_yields_name(tmp_path):
     s = Store(tmp_path / "store")
     with s["model"].lock("-") as name:
         assert name == "model-1"
-        assert (tmp_path / "store" / "models" / "model-1.lock").is_file()  # reserved
+        assert (tmp_path / "store" / "model" / "model-1.lock").is_file()  # reserved
         s["model"][name] = _model()
     assert s["model"]["model-1"]["type"] == "model"
-    assert not (tmp_path / "store" / "models" / "model-1.lock").exists()   # cleared
+    assert not (tmp_path / "store" / "model" / "model-1.lock").exists()   # cleared
 
 
 def test_lock_fitted_mints_version(tmp_path):
@@ -247,7 +247,7 @@ def test_service_create_get_list(tmp_path):
     assert got["ok"] and got["data"]["description"] == "first try"
     listed = svc.list_records("model")
     assert listed["ok"] and listed["data"][0]["description"] == "first try"
-    forbidden = svc.create("batch", "-", _batch())
+    forbidden = svc.create("data", "-", _batch())
     assert forbidden["ok"] is False and forbidden["error"]["code"] == "forbidden"
     missing = svc.get("nope")
     assert missing["ok"] is False and missing["error"]["code"] == "not_found"

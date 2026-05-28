@@ -6,9 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, Iterable, List
-
-import numpy as np
+from typing import Any, Dict, List
 
 try:
     from doe.common import CustomODESystem, ODEModel
@@ -16,26 +14,13 @@ except ImportError:  # pragma: no cover
     from doe.doe.common import CustomODESystem, ODEModel
 
 from mcp_contracts import (
-    Condition,
     EstimateDoeParametersRequest,
-    EstimateDoeParametersResponse,
     ProposeDoeExperimentsRequest,
-    ProposeDoeExperimentsResponse,
 )
 from mcp_errors import ToolExecutionError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DOE_ROOT = REPO_ROOT / "doe"
-
-
-def _ensure_finite_values(name: str, values: Iterable[float]) -> None:
-    for value in values:
-        if not np.isfinite(value):
-            raise ToolExecutionError(
-                code="numeric_instability",
-                message="Non-finite numeric value encountered during computation.",
-                details={"field": name},
-            )
 
 
 def _invalid_model_spec(
@@ -65,8 +50,14 @@ class DoeEngine:
         doe_root: Path = DEFAULT_DOE_ROOT,
     ) -> None:
         self.doe_root = doe_root
-        self._mle_script = self.doe_root / "scripts" / "mle.py"
-        self._new_exp_script = self.doe_root / "scripts" / "new_exp.py"
+        scripts = self.doe_root / "scripts"
+        self._mle_script = scripts / "mle.py"
+        self._new_exp_script = scripts / "new_exp.py"
+        self._gp_fit_script = scripts / "gp_fit.py"
+        self._gp_hyperfit_script = scripts / "gp_hyperfit.py"
+        self._gp_predict_script = scripts / "gp_predict.py"
+        self._gp_doe_script = scripts / "gp_doe.py"
+        self._gp_discriminate_script = scripts / "gp_discriminate.py"
 
     def _create_model(
         self,
@@ -133,7 +124,7 @@ class DoeEngine:
         script_path: Path,
         arguments: List[str],
         failure_message: str,
-    ) -> None:
+    ) -> str:
         if not script_path.is_file():
             raise ToolExecutionError(
                 code="execution_failed",
@@ -181,287 +172,155 @@ class DoeEngine:
                 details=details,
             )
 
-    @staticmethod
-    def _float_list(value: Any, *, field: str) -> List[float]:
-        if not isinstance(value, list) or not value:
-            raise ToolExecutionError(
-                code="execution_failed",
-                message=f"Malformed script output: {field} must be a non-empty list.",
-            )
+        return completed.stdout or ""
 
-        parsed: List[float] = []
-        for item in value:
-            try:
-                parsed.append(float(item))
-            except (TypeError, ValueError) as exc:
-                raise ToolExecutionError(
-                    code="execution_failed",
-                    message=f"Malformed script output: {field} contains non-numeric values.",
-                ) from exc
-        _ensure_finite_values(field, parsed)
-        return parsed
+    @classmethod
+    def _materialise_batches(cls, tmp_dir: Path, batches: Dict[str, Any]) -> List[str]:
+        """Write each ``{batch-name: record}`` to ``<tmp>/<batch-name>.json`` so the script
+        sees the batch name as the file stem (see doe.dataset). Returns the paths."""
+        paths: List[str] = []
+        for name, record in batches.items():
+            path = tmp_dir / f"{name}.json"
+            cls._write_json(path, record)
+            paths.append(str(path))
+        return paths
 
-    def estimate_parameters(
-        self,
-        request: EstimateDoeParametersRequest,
-    ) -> EstimateDoeParametersResponse:
+    def estimate_parameters(self, request: EstimateDoeParametersRequest) -> Dict[str, Any]:
+        # Materialise the resolved inputs to a temp dir, run the store-free script there, and
+        # return its record body verbatim (parameters + fit diagnostics + auxiliary). The MCP
+        # decides nothing about the body shape -- compute_tools just stamps linkage refs.
         self._create_model(request.model_spec)
-        expected_parameter_names = tuple(request.model_spec["parameters"].keys())
-
-        ordered_labels = sorted(request.conditions.keys())
-        conditions_payload = {
-            label: request.conditions[label].dict() for label in ordered_labels
-        }
-        measurements_payload = {
-            label: request.measurements[label].dict() for label in ordered_labels
-        }
 
         with tempfile.TemporaryDirectory(prefix="mcp-doe-estimate-") as tmp:
             tmp_dir = Path(tmp)
             model_path = tmp_dir / "model.json"
-            conditions_path = tmp_dir / "conditions.json"
-            measurements_path = tmp_dir / "measurements.json"
             output_path = tmp_dir / "result.json"
-
             self._write_json(model_path, request.model_spec)
-            self._write_json(conditions_path, conditions_payload)
-            self._write_json(measurements_path, measurements_payload)
+            batch_paths = self._materialise_batches(tmp_dir, request.batches)
 
             args = [
-                "--model",
-                str(model_path),
-                "--conditions",
-                str(conditions_path),
-                "--data",
-                str(measurements_path),
-                "--iterations",
-                str(request.optimizer.iterations),
-                "--rtol",
-                str(request.optimizer.rtol),
-                "--dtype",
-                request.optimizer.dtype,
+                "--model", str(model_path),
+                "--batches", *batch_paths,
+                "--iterations", str(request.optimizer.iterations),
+                "--rtol", str(request.optimizer.rtol),
+                "--dtype", request.optimizer.dtype,
             ]
-
             if request.initial_parameters is not None:
                 initial_path = tmp_dir / "initial.json"
-                self._write_json(initial_path, {"parameters": request.initial_parameters})
+                self._write_json(initial_path, request.initial_parameters)
                 args.extend(["--initial", str(initial_path)])
-
             args.extend(["--output", str(output_path)])
+
             self._run_script(
-                script_path=self._mle_script,
-                arguments=args,
+                script_path=self._mle_script, arguments=args,
                 failure_message="Failed to estimate model parameters.",
             )
+            return self._read_json(output_path, failure_message="Failed to estimate model parameters.")
 
-            result = self._read_json(
-                output_path,
-                failure_message="Failed to estimate model parameters.",
-            )
-
-        raw_parameters = result.get("parameters")
-        if not isinstance(raw_parameters, dict):
-            raise ToolExecutionError(
-                code="execution_failed",
-                message="Malformed script output: parameters must be an object.",
-            )
-
-        expected_parameter_set = set(expected_parameter_names)
-        raw_parameter_set = set(raw_parameters.keys())
-        if raw_parameter_set != expected_parameter_set:
-            missing = sorted(expected_parameter_set - raw_parameter_set)
-            extra = sorted(raw_parameter_set - expected_parameter_set)
-            details: List[str] = []
-            if missing:
-                details.append(f"missing keys: {', '.join(missing)}")
-            if extra:
-                details.append(f"unexpected keys: {', '.join(extra)}")
-            raise ToolExecutionError(
-                code="execution_failed",
-                message=(
-                    "Malformed script output: parameters keys mismatch "
-                    f"({'; '.join(details)})."
-                ),
-            )
-
-        try:
-            parameters = {
-                name: float(raw_parameters[name]) for name in expected_parameter_names
-            }
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ToolExecutionError(
-                code="execution_failed",
-                message="Malformed script output: parameters are missing or invalid.",
-            ) from exc
-        _ensure_finite_values("parameters", parameters.values())
-
-        loss_trace = self._float_list(result.get("loss_trace"), field="loss_trace")
-
-        raw_predictions = result.get("predictions")
-        if not isinstance(raw_predictions, dict):
-            raise ToolExecutionError(
-                code="execution_failed",
-                message="Malformed script output: predictions must be an object.",
-            )
-
-        prediction_payload: Dict[str, List[float]] = {}
-        for label in ordered_labels:
-            if label not in raw_predictions:
-                raise ToolExecutionError(
-                    code="execution_failed",
-                    message="Malformed script output: missing prediction label.",
-                    details={"label": label},
-                )
-
-            series = raw_predictions[label]
-            if not isinstance(series, list) or not series:
-                raise ToolExecutionError(
-                    code="numeric_instability",
-                    message="Prediction output has an unexpected shape.",
-                    details={"label": label},
-                )
-
-            try:
-                parsed_series = [float(v) for v in series]
-            except (TypeError, ValueError) as exc:
-                raise ToolExecutionError(
-                    code="execution_failed",
-                    message="Malformed script output: prediction values must be numeric.",
-                    details={"label": label},
-                ) from exc
-            _ensure_finite_values(f"predictions.{label}", parsed_series)
-            prediction_payload[label] = parsed_series
-
-        return EstimateDoeParametersResponse(
-            parameters=parameters,
-            loss_trace=loss_trace,
-            predictions=prediction_payload,
-        )
-
-    def propose_experiments(
-        self,
-        request: ProposeDoeExperimentsRequest,
-    ) -> ProposeDoeExperimentsResponse:
+    def propose_experiments(self, request: ProposeDoeExperimentsRequest) -> Dict[str, Any]:
+        # As with estimate_parameters: run the script, return its design record body verbatim.
         self._create_model(request.model_spec)
 
         with tempfile.TemporaryDirectory(prefix="mcp-doe-propose-") as tmp:
             tmp_dir = Path(tmp)
             model_path = tmp_dir / "model.json"
             output_path = tmp_dir / "result.json"
-
             self._write_json(model_path, request.model_spec)
 
             args = [
-                "--model",
-                str(model_path),
-                "--n",
-                str(request.proposal_config.n_proposals),
-                "--iterations",
-                str(request.proposal_config.iterations),
-                "--criterion",
-                request.proposal_config.criterion,
-                "--seed",
-                str(request.proposal_config.seed),
-                "--output",
-                str(output_path),
+                "--model", str(model_path),
+                "--n", str(request.proposal_config.n_proposals),
+                "--iterations", str(request.proposal_config.iterations),
+                "--criterion", request.proposal_config.criterion,
+                "--seed", str(request.proposal_config.seed),
+                "--output", str(output_path),
             ]
-
-            if request.history is not None:
-                ordered_labels = sorted(request.history.conditions.keys())
-                history_conditions = {
-                    label: request.history.conditions[label].dict()
-                    for label in ordered_labels
-                }
-                history_data = {
-                    label: {
-                        "timestamps": request.history.timestamps[label],
-                        "measurements": request.history.measurements[label],
-                    }
-                    for label in ordered_labels
-                }
-                conditions_path = tmp_dir / "conditions.json"
-                history_data_path = tmp_dir / "history_data.json"
-                self._write_json(conditions_path, history_conditions)
-                self._write_json(history_data_path, history_data)
-                args.extend([
-                    "--conditions", str(conditions_path),
-                    "--data", str(history_data_path),
-                ])
-
             if request.parameters is not None:
-                parameters_path = tmp_dir / "parameters.json"
-                self._write_json(parameters_path, {"parameters": request.parameters})
-                args.extend(["--parameters", str(parameters_path)])
-
+                params_path = tmp_dir / "parameters.json"
+                self._write_json(params_path, request.parameters)
+                args.extend(["--parameters", str(params_path)])
+            if request.history:
+                history_paths = self._materialise_batches(tmp_dir, request.history)
+                args.extend(["--history", *history_paths])
             if request.proposal_config.regularization is not None:
-                args.extend(
-                    [
-                        "--regularization",
-                        str(request.proposal_config.regularization),
-                    ]
-                )
+                args.extend(["--regularization", str(request.proposal_config.regularization)])
 
             self._run_script(
-                script_path=self._new_exp_script,
-                arguments=args,
+                script_path=self._new_exp_script, arguments=args,
                 failure_message="Failed to propose new experiments.",
             )
+            return self._read_json(output_path, failure_message="Failed to propose new experiments.")
 
-            result = self._read_json(
-                output_path,
-                failure_message="Failed to propose new experiments.",
-            )
+    # --------------------------------------------------------------- GP (subprocess)
+    # Each GP tool materialises its resolved inputs into a temp dir, runs the store-free GP
+    # script there, and returns the parsed result dict (the resolver commits any record).
+    def fit_gp(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        with tempfile.TemporaryDirectory(prefix="mcp-gp-fit-") as tmp:
+            tmp_dir = Path(tmp)
+            model_path = tmp_dir / "model.json"
+            output_path = tmp_dir / "result.json"
+            self._write_json(model_path, request["model_spec"])
+            batch_paths = self._materialise_batches(tmp_dir, request["batches"])
+            args = ["--model", str(model_path), "--batches", *batch_paths, "--output", str(output_path)]
+            if request.get("folds") is not None:
+                args += ["--folds", str(request["folds"])]
+            self._run_script(script_path=self._gp_fit_script, arguments=args, failure_message="Failed to fit GP.")
+            return self._read_json(output_path, failure_message="Failed to fit GP.")
 
-        raw_proposals = result.get("proposals")
-        if not isinstance(raw_proposals, list) or not raw_proposals:
-            raise ToolExecutionError(
-                code="execution_failed",
-                message="Malformed script output: proposals must be a non-empty list.",
-            )
+    def hyper_fit_gp(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        with tempfile.TemporaryDirectory(prefix="mcp-gp-hyperfit-") as tmp:
+            tmp_dir = Path(tmp)
+            model_path = tmp_dir / "model.json"
+            output_path = tmp_dir / "result.json"
+            self._write_json(model_path, request["model_spec"])
+            batch_paths = self._materialise_batches(tmp_dir, request["batches"])
+            args = ["--model", str(model_path), "--batches", *batch_paths, "--output", str(output_path)]
+            self._run_script(script_path=self._gp_hyperfit_script, arguments=args,
+                             failure_message="Failed to hyper-fit GP.")
+            return self._read_json(output_path, failure_message="Failed to hyper-fit GP.")
 
-        proposed_conditions: List[Condition] = []
-        for proposal in raw_proposals:
-            try:
-                condition = Condition.parse_obj(proposal)
-            except Exception as exc:
-                raise ToolExecutionError(
-                    code="execution_failed",
-                    message="Malformed script output: invalid proposed condition.",
-                    details={"type": type(exc).__name__},
-                ) from exc
-            _ensure_finite_values("proposed_conditions", condition.dict().values())
-            proposed_conditions.append(condition)
+    def predict_gp(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        with tempfile.TemporaryDirectory(prefix="mcp-gp-predict-") as tmp:
+            tmp_dir = Path(tmp)
+            paths = {n: tmp_dir / f"{n}.json" for n in ("model", "state", "points")}
+            output_path = tmp_dir / "result.json"
+            self._write_json(paths["model"], request["model_spec"])
+            self._write_json(paths["state"], request["state"])
+            self._write_json(paths["points"], request["points"])
+            args = ["--model", str(paths["model"]), "--state", str(paths["state"]),
+                    "--points", str(paths["points"]), "--output", str(output_path)]
+            self._run_script(script_path=self._gp_predict_script, arguments=args,
+                             failure_message="Failed to predict with GP.")
+            return self._read_json(output_path, failure_message="Failed to predict with GP.")
 
-        proposal_timestamps = self._float_list(result.get("proposal_timestamps"), field="proposal_timestamps")
+    def doe_gp(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        with tempfile.TemporaryDirectory(prefix="mcp-gp-doe-") as tmp:
+            tmp_dir = Path(tmp)
+            paths = {n: tmp_dir / f"{n}.json" for n in ("model", "state", "bounds")}
+            output_path = tmp_dir / "result.json"
+            self._write_json(paths["model"], request["model_spec"])
+            self._write_json(paths["state"], request["state"])
+            self._write_json(paths["bounds"], request["bounds"])
+            args = ["--model", str(paths["model"]), "--state", str(paths["state"]),
+                    "--bounds", str(paths["bounds"]), "--batch-size", str(request["batch_size"]),
+                    "--seed", str(request.get("seed", 0)), "--output", str(output_path)]
+            self._run_script(script_path=self._gp_doe_script, arguments=args,
+                             failure_message="Failed to run GP DoE.")
+            return self._read_json(output_path, failure_message="Failed to run GP DoE.")
 
-        raw_expected = result.get("expected")
-        if not isinstance(raw_expected, list) or not raw_expected:
-            raise ToolExecutionError(
-                code="execution_failed",
-                message="Malformed script output: expected must be a non-empty list.",
-            )
-
-        expected: List[List[float]] = []
-        for idx, row in enumerate(raw_expected):
-            if not isinstance(row, list):
-                raise ToolExecutionError(
-                    code="execution_failed",
-                    message="Malformed script output: each expected trajectory must be a list.",
-                    details={"index": idx},
-                )
-            try:
-                parsed_row = [float(v) for v in row]
-            except (TypeError, ValueError) as exc:
-                raise ToolExecutionError(
-                    code="execution_failed",
-                    message="Malformed script output: expected trajectory values must be numeric.",
-                    details={"index": idx},
-                ) from exc
-            _ensure_finite_values(f"expected[{idx}]", parsed_row)
-            expected.append(parsed_row)
-
-        return ProposeDoeExperimentsResponse(
-            proposed_conditions=proposed_conditions,
-            proposal_timestamps=proposal_timestamps,
-            expected=expected,
-        )
+    def discriminate_gp(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        with tempfile.TemporaryDirectory(prefix="mcp-gp-discriminate-") as tmp:
+            tmp_dir = Path(tmp)
+            paths = {n: tmp_dir / f"{n}.json" for n in ("model", "state", "grid", "bounds")}
+            output_path = tmp_dir / "result.json"
+            self._write_json(paths["model"], request["model_spec"])
+            self._write_json(paths["state"], request["state"])
+            self._write_json(paths["grid"], request["grid"])
+            self._write_json(paths["bounds"], request["bounds"])
+            args = ["--model", str(paths["model"]), "--state", str(paths["state"]),
+                    "--grid", str(paths["grid"]), "--threshold", str(request["threshold"]),
+                    "--bounds", str(paths["bounds"]), "--batch-size", str(request["batch_size"]),
+                    "--seed", str(request.get("seed", 0)), "--output", str(output_path)]
+            self._run_script(script_path=self._gp_discriminate_script, arguments=args,
+                             failure_message="Failed to run discriminative GP DoE.")
+            return self._read_json(output_path, failure_message="Failed to run discriminative GP DoE.")

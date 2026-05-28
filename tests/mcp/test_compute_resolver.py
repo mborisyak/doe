@@ -1,10 +1,13 @@
 """Resolver unit tests with stub inline services -- no jax / subprocess. They check
-name resolution (refs -> the core's inline payload) and result -> store records."""
+name resolution (refs -> the inline payload the engine consumes) and result -> committed
+store records. The resolver resolves refs, locks the output, runs the (stubbed) engine,
+then stamps + commits the record; the stubs just return the engine's plain result."""
 from __future__ import annotations
 
 from compute_tools import ComputeResolver
 from doe.store import Store
 from mcp_errors import error_response, success_response
+from simulate_tools import SimulateResolver
 
 
 class _StubDoe:
@@ -17,23 +20,35 @@ class _StubDoe:
         self.seen["fit"] = request
         if self._fit is not None:
             return self._fit
+        # The engine now returns the script's full fitted_model body; the resolver only stamps
+        # linkage refs (model, fit.data, fit.tool_result, description).
         return success_response({
             "parameters": {"k": 1.5},
-            "loss_trace": [0.9, 0.5, 0.42],
-            "predictions": {label: [0.1, 0.2] for label in request["conditions"]},
+            "fit": {"final_loss": 0.42, "iterations": 3},
+            "auxiliary": {
+                "loss_trace": [0.9, 0.5, 0.42],
+                "predictions": {
+                    b: {"exp-1": {"timestamps": [1.0, 2.0], "A": [0.1, 0.2]}}
+                    for b in request["batches"]
+                },
+            },
         })
 
     def propose_doe_experiments(self, request):
         self.seen["propose"] = request
         if self._propose is not None:
             return self._propose
+        # The engine now returns the script's design body (experiments + auxiliary.expected
+        # keyed by observable); the resolver stamps source + re-keys expected by fitted_model.
         return success_response({
-            "proposed_conditions": [
-                {"A": 1.0, "B": 2.0, "E": 0.5, "temperature": 30.0},
-                {"A": 1.5, "B": 1.0, "E": 0.6, "temperature": 40.0},
-            ],
-            "proposal_timestamps": [1.0, 2.0, 3.0],
-            "expected": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+            "experiments": {
+                "exp-1": {"conditions": {"A": 1.0, "B": 2.0, "E": 0.5, "temperature": 30.0}},
+                "exp-2": {"conditions": {"A": 1.5, "B": 1.0, "E": 0.6, "temperature": 40.0}},
+            },
+            "auxiliary": {"expected": {
+                "exp-1": {"timestamps": [1.0, 2.0, 3.0], "A": [0.1, 0.2, 0.3]},
+                "exp-2": {"timestamps": [1.0, 2.0, 3.0], "A": [0.4, 0.5, 0.6]},
+            }},
         })
 
 
@@ -62,11 +77,13 @@ def _seed_model(store):
 
 
 def _seed_batch(store, name="batch-1"):
-    store["batch"][name] = {
-        "space": ["A", "B", "E", "temperature"],
-        "observable": "A_measured",
-        "experiments": {"experiment-1": {"x": {"A": 1.0, "B": 2.0, "E": 0.5, "temperature": 30.0}}},
-        "auxiliary": {"experiment-1": {"t": [1.0, 2.0], "y": [0.8, 0.6]}},
+    store["data"][name] = {
+        "experiments": {
+            "exp-1": {
+                "conditions": {"A": 1.0, "B": 2.0, "E": 0.5, "temperature": 30.0},
+                "measurements": {"timestamps": [1.0, 2.0], "A": [0.8, 0.6]},
+            }
+        },
     }
 
 
@@ -77,32 +94,32 @@ def test_fit_resolves_refs_and_writes_fitted_model(tmp_path):
     _seed_batch(store, "batch-1")
     _seed_batch(store, "batch-2")
     doe = _StubDoe()
-    resolver = ComputeResolver(store, doe_service=doe, enzyme_service=_StubEnzyme())
+    resolver = ComputeResolver(store, doe_service=doe)
 
     out = resolver.fit(model="model-x", data=["batch-1", "batch-2"], description="first fit")
     assert out["ok"]
+    # refs resolved to the spec + batch records the engine consumes
     req = doe.seen["fit"]
     assert req["model_spec"]["parameters"] == {"k": [0.0, 10.0]}
-    assert set(req["conditions"]) == {"batch-1/experiment-1", "batch-2/experiment-1"}
-    assert req["measurements"]["batch-1/experiment-1"] == {"timestamps": [1.0, 2.0], "measurements": [0.8, 0.6]}
+    assert set(req["batches"]) == {"batch-1", "batch-2"}
+    assert req["batches"]["batch-1"]["experiments"]["exp-1"]["measurements"]["A"] == [0.8, 0.6]
 
     fm = out["references"]["fitted_model"]
     assert fm == "model-x/v1"
-    rec = store.read(fm)
+    rec = store.read(fm)  # committed by the resolver
     assert rec["parameters"] == {"k": 1.5}
     assert rec["model"] == "model-x" and rec["fit"]["data"] == ["batch-1", "batch-2"]
     assert rec["fit"]["final_loss"] == 0.42
-    assert rec["auxiliary"]["loss_trace"] == [0.9, 0.5, 0.42]
-    assert out["references"]["call"] == "fit/model-x/v1"
-    assert store.read("fit/model-x/v1")["tool"] == "fit_parameters"
-    # the returned data nulls auxiliary (wire view)
-    assert out["data"]["auxiliary"] == {"loss_trace": None, "predictions": None}
+    assert rec["auxiliary"]["predictions"]["batch-1"]["exp-1"]["A"] == [0.1, 0.2]
+    assert out["references"]["call"] == "fit_ode/model-x-1"  # call: tool/<target>-<N>
+    assert store.read("fit_ode/model-x-1")["tool"] == "fit_ode"
+    assert "data" not in out  # tools return refs only, no data dump
 
 
 def test_fit_missing_model_is_error(tmp_path):
     store = Store(tmp_path / "store")
     _seed_batch(store, "batch-1")
-    resolver = ComputeResolver(store, doe_service=_StubDoe(), enzyme_service=_StubEnzyme())
+    resolver = ComputeResolver(store, doe_service=_StubDoe())
     out = resolver.fit(model="nope", data=["batch-1"])
     assert out["ok"] is False and out["error"]["code"] == "not_found"
 
@@ -112,11 +129,11 @@ def test_fit_compute_error_frees_the_name(tmp_path):
     _seed_model(store)
     _seed_batch(store, "batch-1")
     failing = _StubDoe(fit=error_response("numeric_instability", "diverged"))
-    resolver = ComputeResolver(store, doe_service=failing, enzyme_service=_StubEnzyme())
+    resolver = ComputeResolver(store, doe_service=failing)
     out = resolver.fit(model="model-x", data=["batch-1"])
     assert out["ok"] is False and out["error"]["code"] == "numeric_instability"
     assert store.names("fitted_model") == []                       # rolled back
-    assert not (tmp_path / "store" / "fitted_models" / "model-x" / "v1.lock").exists()
+    assert not (tmp_path / "store" / "fitted_model" / "model-x" / "v1.lock").exists()
 
 
 # ------------------------------------------------------------------- propose
@@ -124,44 +141,43 @@ def test_propose_writes_design_with_expected(tmp_path):
     store = Store(tmp_path / "store")
     _seed_model(store)
     store["fitted_model"]["model-x"]["v1"] = {"model": "model-x", "parameters": {"k": 1.5}}
-    resolver = ComputeResolver(store, doe_service=_StubDoe(), enzyme_service=_StubEnzyme())
+    resolver = ComputeResolver(store, doe_service=_StubDoe())
 
     out = resolver.propose(fitted_model="model-x/v1", proposal_config={"n_proposals": 2, "seed": 0})
     assert out["ok"]
     design = out["references"]["design"]
     assert design == "design-1"
     rec = store.read(design)
-    assert rec["observable"] == "A"
-    assert set(rec["experiments"]) == {"experiment-1", "experiment-2"}
-    assert rec["experiments"]["experiment-1"]["x"]["temperature"] == 30.0
-    assert rec["auxiliary"]["expected"]["model-x/v1"]["experiment-2"] == [0.4, 0.5, 0.6]
-    assert rec["auxiliary"]["experiment-1"]["t"] == [1.0, 2.0, 3.0]
-    assert store.read("propose/design-1")["tool"] == "propose_doe_experiments"
+    assert set(rec["experiments"]) == {"exp-1", "exp-2"}
+    assert rec["experiments"]["exp-1"]["conditions"]["temperature"] == 30.0
+    assert rec["auxiliary"]["expected"]["model-x/v1"]["exp-2"] == {
+        "timestamps": [1.0, 2.0, 3.0], "A": [0.4, 0.5, 0.6]
+    }
+    assert store.read("doe_ode/model-x/v1-1")["tool"] == "doe_ode"
 
 
 # ------------------------------------------------------------------- simulate
 def test_simulate_from_design_writes_batch(tmp_path):
     store = Store(tmp_path / "store")
     store["design"]["design-1"] = {
-        "space": ["A", "B", "E", "temperature"],
-        "experiments": {"experiment-1": {"x": {"A": 1.0, "B": 2.0, "E": 0.5, "temperature": 30.0}}},
+        "experiments": {"exp-1": {"conditions": {"A": 1.0, "B": 2.0, "E": 0.5, "temperature": 30.0}}},
     }
     enzyme = _StubEnzyme()
-    resolver = ComputeResolver(store, doe_service=_StubDoe(), enzyme_service=enzyme)
+    resolver = SimulateResolver(store, enzyme_service=enzyme)
 
-    out = resolver.simulate(design="design-1", time={"t_start": 0.0, "t_end": 5.0, "measurements": 2})
+    out = resolver.simulate(design="design-1")
     assert out["ok"]
-    assert enzyme.seen["sim"]["conditions"]["experiment-1"]["A"] == 1.0
-    batch = out["references"]["batch"]
+    assert enzyme.seen["sim"]["conditions"]["exp-1"]["A"] == 1.0
+    batch = out["references"]["data"]
     assert batch == "batch-1"
     rec = store.read(batch)
     assert rec["design"] == "design-1"
-    assert rec["experiments"]["experiment-1"]["x"]["temperature"] == 30.0
-    assert rec["auxiliary"]["experiment-1"]["y"] == [0.9, 0.7]
+    assert rec["experiments"]["exp-1"]["conditions"]["temperature"] == 30.0
+    assert rec["experiments"]["exp-1"]["measurements"] == {"timestamps": [1.0, 2.0], "A": [0.9, 0.7]}
 
 
 def test_simulate_requires_design_or_conditions(tmp_path):
     store = Store(tmp_path / "store")
-    resolver = ComputeResolver(store, doe_service=_StubDoe(), enzyme_service=_StubEnzyme())
+    resolver = SimulateResolver(store, enzyme_service=_StubEnzyme())
     out = resolver.simulate()
     assert out["ok"] is False and out["error"]["code"] == "invalid_request"

@@ -120,6 +120,9 @@ docs/source/.doctrees
 !experiments/*.ipynb
 
 tests/data_root/
+tests/e2e_store/
+tests/e2e_gp_store/
+store-example/
 
 release/
 
@@ -137,3 +140,6 @@ data/session_20260318_112412/
 !README.md
 !STORAGE.md
 !STORAGE_FOR_AGENTS.md
+
+# store lock artifact (regenerated on use; not a record)
+.store.lock

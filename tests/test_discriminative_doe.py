@@ -13,7 +13,7 @@ def _toy(n_train=12, grid=8):
   rng = np.random.default_rng(0)
   X = rng.uniform(0.0, 1.0, (n_train, 2))
   y = X[:, 0] + X[:, 1]
-  gp = GP(kernels.rbf_ard(jnp.array([0.3, 0.3], jnp.float32), variance=1.0), noise=1e-3)
+  gp = GP(kernels.rbf(jnp.array([0.3, 0.3], jnp.float32), variance=1.0), noise=1e-3)
   state = gp.fit(jnp.asarray(X, jnp.float32), jnp.asarray(y, jnp.float32))
   ax = np.linspace(0.0, 1.0, grid)
   Xg = jnp.asarray(np.stack(np.meshgrid(ax, ax), -1).reshape(-1, 2), jnp.float32)

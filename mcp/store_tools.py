@@ -34,7 +34,7 @@ class StoreMcpService:
         record: Optional[Dict[str, Any]] = None,
         description: Optional[str] = None,
     ) -> Dict[str, Any]:
-        if type_ == "batch":
+        if type_ == "data":
             return self._err(StoreError(
                 "forbidden",
                 "data (batches) cannot be created directly; they come from the simulate / "

@@ -51,7 +51,7 @@ class DoeMcpService:
                 details={"type": type(exc).__name__},
             )
 
-        return success_response(response.dict())
+        return success_response(response)
 
     def propose_doe_experiments(self, request: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -76,7 +76,33 @@ class DoeMcpService:
                 details={"type": type(exc).__name__},
             )
 
-        return success_response(response.dict())
+        return success_response(response)
+
+    # GP tools: the engine runs the store-free GP scripts in a subprocess and returns the
+    # plain result dict; the resolver commits any record. Requests are plain dicts.
+    def _gp_call(self, fn, request: Dict[str, Any], what: str) -> Dict[str, Any]:
+        try:
+            return success_response(fn(request))
+        except ToolExecutionError as exc:
+            return error_response(code=exc.code, message=exc.message, details=exc.details)
+        except Exception as exc:  # pragma: no cover
+            return error_response(code="internal_error", message=f"Internal error during {what}.",
+                                  details={"type": type(exc).__name__})
+
+    def fit_gp(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        return self._gp_call(self.engine.fit_gp, request, "GP fit")
+
+    def hyper_fit_gp(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        return self._gp_call(self.engine.hyper_fit_gp, request, "GP hyper-fit")
+
+    def predict_gp(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        return self._gp_call(self.engine.predict_gp, request, "GP predict")
+
+    def doe_gp(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        return self._gp_call(self.engine.doe_gp, request, "GP DoE")
+
+    def discriminate_gp(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        return self._gp_call(self.engine.discriminate_gp, request, "discriminative GP DoE")
 
 
 class EnzymeMcpService:

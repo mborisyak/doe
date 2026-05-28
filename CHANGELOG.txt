@@ -1,3 +1,148 @@
+28 May 2026
+=========================
+
+Payload-dump: scripts own the record body, MCP only stamps linkage
+- mle.py / new_exp.py / gp_fit.py / gp_doe.py / gp_discriminate.py now emit the
+  full fitted_model / design body INCLUDING `auxiliary`. The engine passes that
+  dict through verbatim (like the GP methods already did); dropped the
+  EstimateDoeParameters / ProposeDoeExperiments *Response* contracts and the
+  engine's output validation (_float_list, _ensure_finite_values, numpy/Condition
+  imports)
+- compute_tools merge thinned to two stamp helpers: _fitted_record (stamps
+  model, fit.data, fit.tool_result, description) and _design_record (stamps
+  source, description; re-keys auxiliary.expected by the fitted_model ref)
+- GP DoE body assembly (experiments + auxiliary.expected + eig) moved into
+  surrogate.design_body; the resolver no longer carries the GP input-var layout
+- Final on-disk record shapes unchanged -- only the build site moved
+
+simulate is config-owned
+- SimulateEnzymeDynamicsRequest now carries only `conditions` (+ contract_version);
+  dropped TimeConfig / SolutionConcentrations / units / device fields + payloads
+  (UnitsMap kept for the response metadata)
+- EnzymeCliRunner reads experiment.duration / measurements, solutions, noise
+  from config/enzyme.yaml (the same file get_config exposes); device from
+  ENZYME_DEVICE env (default cpu); no t_start shift (window starts at 0); only
+  the noise warning remains
+- simulate_tools.simulate + server.simulate_enzyme_dynamics take design|conditions
+  only; the log's `arguments` no longer record time/solutions/device
+- Fixed the pre-existing test_simulation off-by-one assertion
+
+Store + tool rename
+- Store types: `batch` -> `data` (collection/dir/`type` field; default mint
+  prefix stays `batch-`, records still named batch-N); `tool_result` -> `logs`
+  (per-tool sub-dirs one-to-one with @server.tool function names:
+  logs/fit_ode/, logs/doe_ode/, logs/fit_gp/, logs/doe_gp/,
+  logs/discriminatory_doe_gp/, logs/simulate_enzyme_dynamics/; free-form result-N
+  mints at the top of logs/). doe/store.py TYPES / DEFAULT_PREFIX /
+  NAMESPACE_TYPES / CREATABLE / REQUIRED updated
+- @server.tool function names: fit_parameters -> fit_ode;
+  propose_doe_experiments -> doe_ode. The `tool` string in the log record + the
+  logs sub-dir + the call_name prefix all match the @server.tool name
+  (one-to-one). Internal Python method names (compute.fit, compute.propose,
+  DoeMcpService.fit_parameters, DoeEngine.estimate_parameters) NOT renamed
+- references.batch -> references.data for simulate (ref key now follows the type
+  name like every other tool); names still batch-N
+- Provenance FIELD `tool_result` (in fit.tool_result / source.tool_result) kept
+  as-is -- references_of surfaces it as `call` anyway
+- Resolver writes use proper nested dict paths everywhere:
+  store["fitted_model"][model][version] and store["logs"][tool][leaf]
+  (instead of compound-string keys like store["fitted_model"]["model-x/v1"])
+
+Tests + e2e fixtures
+- tests/mcp full suite green (80 passed). The previously-failing
+  test_simulation::test_runner_simulate_transforms_cli_output is fixed
+- tests/e2e_store and tests/e2e_gp_store regenerated end-to-end with the new
+  layout (data/, logs/<tool>/)
+- test_compute_resolver / test_doe_tools / test_doe_contracts / test_e2e /
+  test_e2e_gp / test_engine / test_simulation / test_store / test_server updated
+  for the new body shapes, call naming, type renames, and tool renames. Removed
+  the two obsolete response-contract tests. test_enzyme_tools already used a
+  conditions-only simulate payload -- no change
+
+Docs + store-example
+- scripts/make_store_example.py (new, re-runnable): wipes + rewrites
+  store-example/ via the doe.store API in current conventions -- singular dirs
+  (model/, fitted_model/, design/, data/, logs/), per-tool log sub-dirs,
+  {tool, status, arguments, inputs, outputs} log records, ODE preds without
+  sigma, a free-form result-1, a kind:"gp" model-y. Writes through proper
+  nested dict paths (store["fitted_model"]["model-x"]["v1"], etc.)
+- STORAGE.md: updated tools / collections / record-shapes / naming /
+  tool-signatures / file-layout to the new conventions (singular dirs,
+  tool/<target>-N calls, payload-dump record bodies, simulate config-owned,
+  batch/tool_result -> data/logs, fit_parameters/propose_doe_experiments ->
+  fit_ode/doe_ode, refs-only returns); Python-API examples use the proper
+  nested dict path everywhere
+- STORAGE_FOR_AGENTS.md: same renames + simulate signature without
+  time/solutions/device
+
+
+27 May 2026
+=========================
+
+Record schema (store-example/, STORAGE.md)
+- Batch/design `experiments` is a dict {exp-N: {conditions, measurements}};
+  dropped redundant `space` and `observable`; `x`->`conditions`,
+  experiment-N -> exp-N
+- measurements / predictions / expected are quantity-keyed dicts
+  {timestamps, <obs>, sigma_<obs>?} -- `timestamps` is a key inside the dict.
+  Real batch measurements carry no sigma; predictions/expected (model output)
+  carry predictive std as sigma_<obs>
+- predictions nested {batch: {exp: {...}}}; expected {model/v: {exp: {...}}}
+- GP model `observables` is a list of names (ODE keeps a dict name->expr)
+
+doe/dataset.py (new)
+- assemble(paths) merges batch files by (filename-stem, exp); from_store(store,
+  names); .series(obs) bridges to the inference core's generic shape; CLI
+  `python -m doe.dataset a.json b.json -o out.json`
+
+Scripts store-free; the MCP layer is the sole store authority
+- mle.py / new_exp.py take file paths (--model spec, --batches/--history,
+  --output RESULT.json), no store/locks/names; emit a plain result JSON
+- mcp_engine materialises resolved inputs to a temp dir, runs the store-free
+  script as a subprocess, reads result.json; compute_tools resolves refs,
+  reserves+locks the output name, runs, then stamps + commits the record + a
+  thin tool_result, releases. The MCP layer is the only writer.
+- tool_result trimmed to {tool, status, inputs, references} (dropped the
+  envelope blob that duplicated the result)
+
+doe/store.py
+- lock() returns a dual-use _Reservation: context manager AND acquire()/
+  release() pair (like threading.Lock), with a guarded __del__ safety net;
+  the old _lock contextmanager split into _reserve / _release
+
+GP surrogate tools (doe/gp/surrogate.py, scripts/gp_*.py, mcp/*)
+- New tools: create_gp, hyper_fit_gp, fit_gp, predict_gp, doe_gp,
+  discriminatory_doe_gp. The GP maps (conditions, t) -> one observable; a single
+  observable is enforced and outputs are keyed by observable name
+- doe_gp = batch BALD (1/2 logdet(I + noise^-1 Sigma_BB)); discriminatory_doe_gp
+  uses doe/doe/discriminative.py; fitted GP State serialised to JSON in the
+  fitted_model's auxiliary
+- Run as subprocess scripts via the engine, uniform with the ODE tools
+
+doe/gp/kernels.py
+- merged rbf + rbf_ard into one rbf (scalar length_scale = isotropic, vector =
+  per-dimension); callers and docs updated
+
+mcp/config_tools.py, mcp/server.py
+- new get_config() tool: returns config/<DOE_CONFIG>.yaml (default enzyme),
+  the lone agent-facing config (bounds, durations, concentrations, noise)
+
+doe/__init__.py, doe/common/common.py (import latency)
+- doe/__init__.py made lazy (PEP 562 __getattr__) so importing a light submodule
+  (doe.gp, doe.dataset) no longer pulls in the ODE/common/inference stack;
+  doe.common.X attribute access still works
+- removed an unused `import diffrax` from common.py (only referenced in
+  comments) -- it dragged in diffrax + optimistix on every doe import
+
+tests / docs
+- tests/mcp/test_e2e.py (ODE) and test_e2e_gp.py (GP) drive the real server
+  tools end to end against fixed gitignored stores (tests/e2e_store,
+  tests/e2e_gp_store); added test_gp_tools.py, test_config_tools.py; updated
+  test_compute_resolver / doe_contracts / doe_tools / engine / server
+- STORAGE.md + STORAGE_FOR_AGENTS.md updated to the new schema + tools;
+  MCP.md added (human overview of the MCP tools)
+
+
 20 March 2026
 =========================
 

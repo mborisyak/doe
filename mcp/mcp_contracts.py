@@ -141,16 +141,9 @@ class OptimizerConfigPayload(TypedDict, total=False):
 
 class EstimateDoeParametersRequestPayload(TypedDict):
     model_spec: Required[Dict[str, Any]]
-    conditions: Required[Dict[str, ConditionPayload]]
-    measurements: Required[Dict[str, MeasurementSeriesPayload]]
+    batches: Required[Dict[str, Any]]  # name -> batch record
     initial_parameters: NotRequired[Dict[str, float]]
     optimizer: NotRequired[OptimizerConfigPayload]
-
-
-class HistoryPayload(TypedDict):
-    conditions: Dict[str, ConditionPayload]
-    timestamps: Dict[str, List[float]]
-    measurements: Dict[str, List[float]]
 
 
 class ProposalConfigPayload(TypedDict, total=False):
@@ -164,7 +157,7 @@ class ProposalConfigPayload(TypedDict, total=False):
 class ProposeDoeExperimentsRequestPayload(TypedDict):
     model_spec: Required[Dict[str, Any]]
     parameters: NotRequired[Dict[str, float]]
-    history: NotRequired[HistoryPayload]
+    history: NotRequired[Dict[str, Any]]  # name -> batch record
     proposal_config: Required[ProposalConfigPayload]
 
 
@@ -239,69 +232,18 @@ class OptimizerConfig(StrictBaseModel):
 
 
 class EstimateDoeParametersRequest(StrictBaseModel):
+    # Resolved by the MCP from refs: the model spec + batch records. The script reads them
+    # from temp files and writes a plain result; the MCP stamps + commits the record.
     model_spec: Dict[str, Any]
-    conditions: Dict[str, Condition]
-    measurements: Dict[str, MeasurementSeries]
+    batches: Dict[str, Any]  # batch name -> batch record
     initial_parameters: Optional[Dict[str, float]] = None
     optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
 
-    @validator("model_spec")
-    def validate_model_spec(cls, value: Dict[str, Any]) -> Dict[str, Any]:
-        return _validate_model_spec_input(value)
-
-    @validator("conditions")
-    def validate_conditions(cls, value: Dict[str, Condition]) -> Dict[str, Condition]:
+    @validator("batches")
+    def validate_batches(cls, value: Dict[str, Any]) -> Dict[str, Any]:
         if not value:
-            raise ValueError("conditions must contain at least one experiment.")
+            raise ValueError("batches must contain at least one batch.")
         return value
-
-    @validator("measurements")
-    def validate_measurements_map(
-        cls, value: Dict[str, MeasurementSeries]
-    ) -> Dict[str, MeasurementSeries]:
-        if not value:
-            raise ValueError("measurements must contain at least one experiment.")
-        return value
-
-    @validator("initial_parameters")
-    def validate_initial_parameters(
-        cls, value: Optional[Dict[str, float]]
-    ) -> Optional[Dict[str, float]]:
-        if value is None:
-            return value
-        return _validate_scalar_map(
-            map_name="initial_parameters",
-            value=value,
-        )
-
-    @root_validator
-    def validate_label_alignment(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        conditions = values.get("conditions") or {}
-        measurements = values.get("measurements") or {}
-        model_spec = values.get("model_spec")
-        initial_parameters = values.get("initial_parameters")
-
-        condition_labels = set(conditions.keys())
-        measurement_labels = set(measurements.keys())
-        if condition_labels != measurement_labels:
-            missing = sorted(condition_labels - measurement_labels)
-            extra = sorted(measurement_labels - condition_labels)
-            details: List[str] = []
-            if missing:
-                details.append(f"missing measurements for labels: {', '.join(missing)}")
-            if extra:
-                details.append(f"measurements without conditions: {', '.join(extra)}")
-            raise ValueError(
-                f"conditions/measurements labels mismatch ({'; '.join(details)})."
-            )
-
-        if isinstance(model_spec, dict) and isinstance(initial_parameters, dict):
-            _validate_key_set(
-                map_name="initial_parameters",
-                keys=set(initial_parameters.keys()),
-                required_keys=_model_spec_parameter_names(model_spec),
-            )
-        return values
 
 
 class HistoryConfig(StrictBaseModel):
@@ -381,108 +323,16 @@ class ProposalConfig(StrictBaseModel):
 
 
 class ProposeDoeExperimentsRequest(StrictBaseModel):
+    # Resolved by the MCP from the fitted_model ref (spec + parameters) and history refs.
     model_spec: Dict[str, Any]
     parameters: Optional[Dict[str, float]] = None
-    history: Optional[HistoryConfig] = None
+    history: Optional[Dict[str, Any]] = None  # batch name -> batch record
     proposal_config: ProposalConfig
 
-    @validator("model_spec")
-    def validate_model_spec(cls, value: Dict[str, Any]) -> Dict[str, Any]:
-        return _validate_model_spec_input(value)
 
-    @validator("parameters")
-    def validate_parameters(
-        cls, value: Optional[Dict[str, float]]
-    ) -> Optional[Dict[str, float]]:
-        if value is None:
-            return value
-        return _validate_scalar_map(
-            map_name="parameters",
-            value=value,
-        )
-
-    @root_validator
-    def validate_parameter_keys(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        model_spec = values.get("model_spec")
-        parameters = values.get("parameters")
-        if isinstance(model_spec, dict) and isinstance(parameters, dict):
-            _validate_key_set(
-                map_name="parameters",
-                keys=set(parameters.keys()),
-                required_keys=_model_spec_parameter_names(model_spec),
-            )
-        return values
-
-
-class EstimateDoeParametersResponse(StrictBaseModel):
-    parameters: Dict[str, float]
-    loss_trace: List[float]
-    predictions: Dict[str, List[float]]
-
-    @validator("parameters")
-    def validate_parameters(cls, value: Dict[str, float]) -> Dict[str, float]:
-        return _validate_scalar_map(
-            map_name="parameters",
-            value=value,
-        )
-
-    @validator("loss_trace")
-    def validate_loss_trace(cls, value: List[float]) -> List[float]:
-        if not value:
-            raise ValueError("loss_trace cannot be empty.")
-        return [_ensure_finite("loss_trace", float(v)) for v in value]
-
-    @validator("predictions")
-    def validate_predictions(
-        cls, value: Dict[str, List[float]]
-    ) -> Dict[str, List[float]]:
-        if not value:
-            raise ValueError("predictions cannot be empty.")
-        cleaned: Dict[str, List[float]] = {}
-        for label, series in value.items():
-            if not series:
-                raise ValueError(f"predictions[{label}] cannot be empty.")
-            cleaned[label] = [
-                _ensure_finite(f"predictions[{label}]", float(v)) for v in series
-            ]
-        return cleaned
-
-
-class ProposeDoeExperimentsResponse(StrictBaseModel):
-    proposed_conditions: List[Condition]
-    proposal_timestamps: List[float]
-    expected: List[List[float]]
-
-    @validator("proposed_conditions")
-    def validate_proposed_conditions(cls, value: List[Condition]) -> List[Condition]:
-        if not value:
-            raise ValueError("proposed_conditions cannot be empty.")
-        return value
-
-    @validator("proposal_timestamps")
-    def validate_proposal_timestamps(cls, value: List[float]) -> List[float]:
-        if not value:
-            raise ValueError("proposal_timestamps cannot be empty.")
-        return [_ensure_finite("proposal_timestamps", float(v)) for v in value]
-
-    @validator("expected")
-    def validate_expected(cls, value: List[List[float]]) -> List[List[float]]:
-        if not value:
-            raise ValueError("expected cannot be empty.")
-        return [
-            [_ensure_finite("expected", float(v)) for v in row]
-            for row in value
-        ]
-
-    @root_validator
-    def validate_lengths(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        proposed = values.get("proposed_conditions") or []
-        expected = values.get("expected") or []
-        if len(proposed) != len(expected):
-            raise ValueError(
-                "proposed_conditions and expected must have equal length."
-            )
-        return values
+# The fit/propose scripts now own their full record body (parameters/experiments + fit +
+# auxiliary); the engine passes that dict through and compute_tools stamps linkage refs, so
+# there are no EstimateDoeParameters/ProposeDoeExperiments *response* contracts to validate.
 
 
 # ---------------------------------------------------------------------------
@@ -498,12 +348,6 @@ def _ensure_json_number(name: str, value: Any) -> float:
     return float(value)
 
 
-def _ensure_json_int(name: str, value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be an integer.")
-    return int(value)
-
-
 class EnzymeConditionPayload(TypedDict):
     A: float
     B: float
@@ -511,32 +355,12 @@ class EnzymeConditionPayload(TypedDict):
     temperature: float
 
 
-class TimeConfigPayload(TypedDict, total=False):
-    t_start: float
-    t_end: float
-    measurements: int
-
-
-class SolutionConcentrationsPayload(TypedDict, total=False):
-    A: float
-    B: float
-    E: float
-
-
-class UnitsMapPayload(TypedDict, total=False):
-    time: str
-    temperature: str
-    solution_volume: str
-    concentration: str
-
-
+# Sampling window (duration, measurements), solution concentrations, and noise are
+# config-owned (config/enzyme.yaml), and the device comes from the ENZYME_DEVICE env var;
+# none of them are agent parameters, so the request carries only the conditions to run.
 class SimulateEnzymeDynamicsRequestPayload(TypedDict):
     conditions: Required[Dict[str, EnzymeConditionPayload]]
     contract_version: NotRequired[str]
-    time: NotRequired[TimeConfigPayload]
-    solutions: NotRequired[SolutionConcentrationsPayload]
-    device: NotRequired[str]
-    units: NotRequired[UnitsMapPayload]
 
 
 class EnzymeCondition(BaseModel):
@@ -562,52 +386,6 @@ class EnzymeCondition(BaseModel):
         return _ensure_finite("temperature", value)
 
 
-class TimeConfig(BaseModel):
-    t_start: float = Field(0.0, description="Start time in seconds.")
-    t_end: float = Field(30.0, description="End time in seconds.")
-    measurements: int = Field(10, description="Number of measurement points.")
-
-    class Config:
-        extra = "forbid"
-
-    @validator("t_start", "t_end", pre=True)
-    def validate_finite_times(cls, value: float, field: Any) -> float:
-        value = _ensure_json_number(field.name, value)
-        return _ensure_finite(field.name, value)
-
-    @validator("measurements", pre=True)
-    def validate_measurements(cls, value: int) -> int:
-        value = _ensure_json_int("measurements", value)
-        if value <= 1:
-            raise ValueError("measurements must be greater than 1.")
-        return value
-
-    @root_validator
-    def validate_time_window(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        t_start = values.get("t_start")
-        t_end = values.get("t_end")
-        if t_start is not None and t_end is not None and t_end <= t_start:
-            raise ValueError("t_end must be greater than t_start.")
-        return values
-
-
-class SolutionConcentrations(BaseModel):
-    A: float = Field(3.0, description="Concentration of A solution in mM.")
-    B: float = Field(3.0, description="Concentration of B solution in mM.")
-    E: float = Field(3.0e-3, description="Concentration of E solution in mM.")
-
-    class Config:
-        extra = "forbid"
-
-    @validator("A", "B", "E", pre=True)
-    def validate_solution_concentration(cls, value: float, field: Any) -> float:
-        value = _ensure_json_number(field.name, value)
-        value = _ensure_finite(field.name, value)
-        if value < 0.0:
-            raise ValueError(f"{field.name} concentration must be non-negative.")
-        return value
-
-
 class UnitsMap(BaseModel):
     time: str = "s"
     temperature: str = "C"
@@ -619,12 +397,10 @@ class UnitsMap(BaseModel):
 
 
 class SimulateEnzymeDynamicsRequest(BaseModel):
+    # The agent supplies only the conditions to run; the sampling window, concentrations,
+    # noise, and device are config/env-owned (read by EnzymeCliRunner), not request fields.
     contract_version: str = Field(TOOL_CONTRACT_VERSION)
     conditions: Dict[str, EnzymeCondition]
-    time: TimeConfig = Field(default_factory=TimeConfig)
-    solutions: SolutionConcentrations = Field(default_factory=SolutionConcentrations)
-    device: str = Field("cpu", description="JAX device name, e.g. cpu or gpu:0.")
-    units: UnitsMap = Field(default_factory=UnitsMap)
 
     class Config:
         extra = "forbid"
@@ -643,14 +419,6 @@ class SimulateEnzymeDynamicsRequest(BaseModel):
     ) -> Dict[str, EnzymeCondition]:
         if not value:
             raise ValueError("conditions must contain at least one experiment.")
-        return value
-
-    @validator("device", pre=True)
-    def validate_device(cls, value: str) -> str:
-        if not isinstance(value, str):
-            raise ValueError("device must be a string.")
-        if not value.strip():
-            raise ValueError("device must be a non-empty string.")
         return value
 
 

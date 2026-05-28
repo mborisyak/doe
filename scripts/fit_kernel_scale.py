@@ -41,7 +41,7 @@ def space_filling(n_per_axis):
 
 
 def fit_hypers(Xn, y, noise, ls_bounds=(0.02, 3.0), var_bounds=(1e-3, 1e3)):
-  """Maximise GP log marginal likelihood over per-dimension (ARD) length scales
+  """Maximise GP log marginal likelihood over per-dimension length scales
   and the signal variance. Returns (length_scales (D,), variance, LML)."""
   X = jnp.asarray(Xn, jnp.float32)
   yj = jnp.asarray(y, jnp.float32)
@@ -49,7 +49,7 @@ def fit_hypers(Xn, y, noise, ls_bounds=(0.02, 3.0), var_bounds=(1e-3, 1e3)):
 
   def neg_lml(theta):                                   # theta = [log_ls_0..D-1, log_var]
     ls, var = jnp.exp(theta[:dim]), jnp.exp(theta[dim])
-    gp = GP(kernels.rbf_ard(ls, variance=var), noise=noise)
+    gp = GP(kernels.rbf(ls, variance=var), noise=noise)
     return -gp.log_marginal_likelihood(X, yj)
 
   val_grad = jax.jit(jax.value_and_grad(neg_lml))
@@ -70,12 +70,12 @@ def fit_hypers(Xn, y, noise, ls_bounds=(0.02, 3.0), var_bounds=(1e-3, 1e3)):
 
 
 def lml_curve_dim(Xn, y, noise, ls_opt, var, d, ls_grid):
-  """LML as one ARD length scale (dim d) varies, the others held at the optimum."""
+  """LML as one length scale (dim d) varies, the others held at the optimum."""
   X, yj = jnp.asarray(Xn, jnp.float32), jnp.asarray(y, jnp.float32)
   out = []
   for v in ls_grid:
     ls = ls_opt.copy(); ls[d] = float(v)
-    gp = GP(kernels.rbf_ard(ls, variance=var), noise=noise)
+    gp = GP(kernels.rbf(ls, variance=var), noise=noise)
     out.append(float(gp.log_marginal_likelihood(X, yj)))
   return np.array(out)
 
@@ -104,7 +104,7 @@ def main():
 
   ls, var, lml = fit_hypers(Xn, y, noise)
   dim_names = ["alpha", "T"]
-  print("fitted ARD length scales (normalised box): " +
+  print("fitted length scales (normalised box): " +
         ", ".join(f"{dim_names[d]}={ls[d]:.4f}" for d in range(len(ls))) +
         f"  variance={var:.4f}  (noise={noise:.5f}, LML={lml:.2f})")
 
@@ -121,9 +121,9 @@ def main():
             lw=2, label=f"{dim_names[d]} (opt={ls[d]:.3f})")
     ax.axvline(ls[d], color=f"C{d}", ls="--", alpha=0.6)
   ax.set_xscale("log")
-  ax.set_xlabel("ARD length scale of one dim (others at optimum)")
+  ax.set_xlabel("length scale of one dim (others at optimum)")
   ax.set_ylabel("log marginal likelihood")
-  ax.set_title(f"ARD kernel scale selection (full vs {args.reference})")
+  ax.set_title(f"RBF kernel scale selection (full vs {args.reference})")
   ax.legend()
   fig.tight_layout()
   fig.savefig(args.plot, dpi=130)

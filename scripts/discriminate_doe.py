@@ -207,7 +207,7 @@ def main():
   ap.add_argument("--hypers", default="kernel_hypers.json",
                   help="JSON from fit_kernel_scale.py; falls back to defaults if missing")
   ap.add_argument("--length-scales", type=float, nargs=2, default=[0.22, 0.22],
-                  help="ARD RBF length scales (alpha, T) if no --hypers")
+                  help="RBF length scales (alpha, T) if no --hypers")
   ap.add_argument("--variance", type=float, default=1.0, help="RBF variance if no --hypers")
   args = ap.parse_args()
 
@@ -227,7 +227,7 @@ def main():
   norm_pts = np.column_stack([(pts[:, 0] - a_lo) / (a_hi - a_lo), pts[:, 1] / 100.0])
   Xg = jnp.asarray(norm_pts, dtype=jnp.float32)             # normalised grid for the GP
 
-  # ---- GP (ARD RBF kernel, fixed hypers throughout) ----
+  # ---- GP (RBF kernel, fixed hypers throughout) ----
   noise = (np.sqrt(n_t) * config["noise"]) ** 2             # ~ propagated measurement noise
   length_scales, variance = list(args.length_scales), args.variance
   if os.path.exists(args.hypers):
@@ -236,13 +236,13 @@ def main():
     length_scales = hp["length_scales"] if "length_scales" in hp else [hp["length_scale"]] * 2
     variance = hp["variance"]
     noise = hp.get("noise", noise)
-    print(f"loaded ARD hypers from {args.hypers}: length_scales(alpha,T)="
+    print(f"loaded hypers from {args.hypers}: length_scales(alpha,T)="
           f"[{length_scales[0]:.4f}, {length_scales[1]:.4f}], variance={variance:.4f}, "
           f"noise={noise:.5f}")
   else:
     print(f"--hypers '{args.hypers}' not found; using defaults "
           f"length_scales={length_scales}, variance={variance}")
-  kernel = kernels.rbf_ard(jnp.asarray(length_scales, jnp.float32), variance=variance)
+  kernel = kernels.rbf(jnp.asarray(length_scales, jnp.float32), variance=variance)
   gp = GP(kernel, noise=noise)
 
   # ---- sample parameter sets and run a DoE loop on each ----

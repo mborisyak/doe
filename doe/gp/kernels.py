@@ -8,15 +8,9 @@ import jax.numpy as jnp
 
 
 def rbf(length_scale=1.0, variance=1.0):
-  def k(x1, x2):
-    sqdist = jnp.sum((x1 - x2) ** 2)
-    return variance * jnp.exp(-0.5 * sqdist / length_scale ** 2)
-  return k
-
-
-def rbf_ard(length_scales, variance=1.0):
-  """RBF with per-dimension length scales (ARD): length_scales is a (D,) vector."""
-  ls = jnp.asarray(length_scales)
+  """RBF kernel. `length_scale` is a scalar (isotropic) or a (D,) vector giving a
+  separate scale per input dimension; each dimension is divided by its own scale."""
+  ls = jnp.asarray(length_scale)
   def k(x1, x2):
     sqdist = jnp.sum(((x1 - x2) / ls) ** 2)
     return variance * jnp.exp(-0.5 * sqdist)

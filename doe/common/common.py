@@ -4,8 +4,6 @@ from collections import namedtuple
 import jax
 import jax.numpy as jnp
 
-import diffrax
-
 SOLUTIONS = {
   'A': 3.0,
   'B': 3.0,

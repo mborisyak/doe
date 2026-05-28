@@ -2,18 +2,21 @@
 CLI script for Maximum Likelihood Estimation using a CustomODESystem.
 
 Usage:
-  python scripts/mle.py --model MODEL_SPEC.json --conditions CONDITIONS.json --data MEASUREMENTS.json [options]
+  python scripts/mle.py --store STORE_ROOT --model MODEL_NAME --batches BATCH_NAME [BATCH_NAME ...] [options]
 
 Example:
-  python scripts/mle.py --model data/secret/simple.json --conditions data/experiments/example.json --data data/experiments/measurements.json
+  python scripts/mle.py --store store --model model-x --batches batch-1 batch-2
+
+Reads everything from the store by ref (see doe.store / doe.dataset): the model spec
+from `model`, and the batch experiments from `batches`, merged and labelled by
+`<batch-name>/<exp>`. Conditions and the observable's measured series are pulled out
+per experiment.
 
 Arguments:
-  --model        Path to JSON file defining the CustomODESystem spec.
-  --conditions   Path to JSON file with experimental conditions
-                 (dict: label -> {A, B, E, temperature}).
-  --data         Path to JSON file with measurements
-                 (dict: label -> {timestamps: [...], measurements: [...]}).
-  --initial      Optional JSON file with initial parameter values.
+  --store        Store root directory (default: store).
+  --model        Model ref (store name); its spec is read from the store.
+  --batches      One or more batch refs (store names).
+  --initial      Optional fitted_model ref; its parameters seed the optimiser.
                  Accepted forms:
                    {"q": ..., "K_A": ..., "K_B": ...}
                  or
@@ -36,6 +39,7 @@ import jax.numpy as jnp
 
 from doe.common import Conditions
 from doe.common.custom import CustomODESystem
+from doe.dataset import assemble
 from doe.inference import maximum_likelihood_estimate
 
 
@@ -43,12 +47,10 @@ def parse_args():
   p = argparse.ArgumentParser(description='Maximum Likelihood Estimation with CustomODESystem.')
   p.add_argument('--model', required=True, metavar='FILE',
                  help='JSON file with the CustomODESystem spec.')
-  p.add_argument('--conditions', required=True, metavar='FILE',
-                 help='JSON file with experimental conditions.')
-  p.add_argument('--data', required=True, metavar='FILE',
-                 help='JSON file with timestamps and measurements per experiment.')
+  p.add_argument('--batches', required=True, nargs='+', metavar='FILE',
+                 help='One or more batch JSON files (batch name = basename stem).')
   p.add_argument('--initial', metavar='FILE', default=None,
-                 help='Optional JSON file with initial parameter values.')
+                 help='Optional JSON file with initial parameter values {name: value}.')
   p.add_argument('--dtype', choices=('float32', 'float64'), default='float32',
                  help='Numeric dtype for optimisation (default: float32).')
   p.add_argument('--iterations', type=int, default=1024, metavar='N',
@@ -64,27 +66,19 @@ def parse_args():
   return p.parse_args()
 
 
-def main():
-  args = parse_args()
+def _fit(args, spec):
+  # Observable to fit against (the ODE core supports the single observable "A").
+  observable = next(iter(spec['observables']))
 
-  with open(args.model) as f:
-    spec = json.load(f)
-
-  with open(args.conditions) as f:
-    conditions = json.load(f)
-
-  with open(args.data) as f:
-    data = json.load(f)
-
-  # Validate that condition and data labels match
-  missing_data = set(conditions) - set(data)
-  missing_cond = set(data) - set(conditions)
-  if missing_data:
-    print(f'error: experiments in conditions but missing from data: {sorted(missing_data)}', file=sys.stderr)
+  # Assemble the batch files into one dataset, then pull out the conditions and the
+  # observable's measured series. Labels are "<batch>/<exp>" (batch = filename stem).
+  dataset = assemble(args.batches)
+  data = dataset.series(observable)
+  if not data:
+    print(f'error: no experiment measures observable {observable!r} in {args.batches}', file=sys.stderr)
     sys.exit(1)
-  if missing_cond:
-    print(f'error: experiments in data but missing from conditions: {sorted(missing_cond)}', file=sys.stderr)
-    sys.exit(1)
+  all_conditions = dataset.conditions()
+  conditions = {label: all_conditions[label] for label in data}
 
   model = CustomODESystem(spec)
   parameter_ranges = model.parameter_ranges()
@@ -96,20 +90,15 @@ def main():
   if args.initial is not None:
     with open(args.initial) as f:
       initial_payload = json.load(f)
-
     if isinstance(initial_payload, dict) and 'parameters' in initial_payload:
       initial_payload = initial_payload['parameters']
-
-    if not isinstance(initial_payload, dict):
-      print('error: --initial must be a JSON object or contain top-level "parameters" object', file=sys.stderr)
-      sys.exit(1)
 
     expected = set(model.parameters.keys())
     provided = set(initial_payload.keys())
     missing = sorted(expected - provided)
     extra = sorted(provided - expected)
     if missing:
-      print(f'error: initial parameter file is missing required keys: {missing}', file=sys.stderr)
+      print(f'error: initial parameter file is missing keys: {missing}', file=sys.stderr)
       sys.exit(1)
     if extra:
       print(f'error: initial parameter file has unexpected keys: {extra}', file=sys.stderr)
@@ -129,19 +118,38 @@ def main():
     dtype=dtype,
   )
 
+  # flat (per "<batch>/<exp>" label) for diagnostics; nested for the stored record.
+  flat_predictions = {label: [float(v) for v in pred] for label, pred in predictions.items()}
+
   residuals = {}
-  for label, pred in predictions.items():
+  for label, pred in flat_predictions.items():
     measured = data[label]['measurements']
     residuals[label] = [float(p - m) for p, m in zip(pred, measured)]
 
-  result = {
-    'parameters': {name: float(getattr(parameters, name)) for name in model.parameters},
+  # store shape: {batch: {exp: {timestamps, <obs>}}} -- sigma omitted (MLE point fit).
+  nested_predictions = {}
+  for label, pred in flat_predictions.items():
+    batch, _, exp = label.partition('/')
+    nested_predictions.setdefault(batch, {})[exp] = {
+      'timestamps': [float(t) for t in data[label]['timestamps']],
+      observable: pred,
+    }
+
+  # The script owns the fitted_model record body (parameters + fit diagnostics + auxiliary);
+  # the MCP layer dumps this and only stamps linkage refs (model, fit.data, fit.tool_result).
+  auxiliary = {
     'loss_trace': [float(v) for v in losses],
-    'loss': float(losses[-1]),
-    'iterations': int(len(losses)),
-    'predictions': {label: [float(v) for v in pred] for label, pred in predictions.items()},
+    'predictions': nested_predictions,
     'residuals': residuals,
     'rmse': {label: (sum(r ** 2 for r in res) / len(res)) ** 0.5 for label, res in residuals.items()},
+  }
+  result = {
+    'parameters': {name: float(getattr(parameters, name)) for name in model.parameters},
+    'fit': {
+      'final_loss': float(losses[-1]),
+      'iterations': int(len(losses)),
+    },
+    'auxiliary': auxiliary,
   }
 
   if args.loo:
@@ -171,9 +179,9 @@ def main():
       label: [float(p - m) for p, m in zip(loo_predictions[label], data[label]['measurements'])]
       for label in labels
     }
-    result['loo_predictions'] = loo_predictions
-    result['loo_residuals'] = loo_residuals
-    result['loo_rmse'] = {
+    auxiliary['loo_predictions'] = loo_predictions
+    auxiliary['loo_residuals'] = loo_residuals
+    auxiliary['loo_rmse'] = {
       label: (sum(r ** 2 for r in res) / len(res)) ** 0.5
       for label, res in loo_residuals.items()
     }
@@ -188,7 +196,7 @@ def main():
 
     # --- loss trace ---
     ax = axes[0, 0]
-    mean_rmse = sum(result['rmse'].values()) / len(result['rmse'])
+    mean_rmse = sum(auxiliary['rmse'].values()) / len(auxiliary['rmse'])
     ax.plot(losses)
     ax.set_title(f'Optimisation loss\nmean RMSE={mean_rmse:.4f}')
     ax.set_xlabel('iteration')
@@ -215,15 +223,15 @@ def main():
       ax = axes[1, i]
       ts = data[label]['timestamps']
       meas = data[label]['measurements']
-      pred = result['predictions'][label]
-      rmse = result['rmse'][label]
+      pred = flat_predictions[label]
+      rmse = auxiliary['rmse'][label]
 
       ax.scatter(ts, meas, label='data', zorder=5, s=30)
       ax.plot(ts, pred, label=f'fit  RMSE={rmse:.4f}')
 
-      if 'loo_predictions' in result:
-        loo_pred = result['loo_predictions'][label]
-        loo_rmse = result['loo_rmse'][label]
+      if 'loo_predictions' in auxiliary:
+        loo_pred = auxiliary['loo_predictions'][label]
+        loo_rmse = auxiliary['loo_rmse'][label]
         ax.plot(ts, loo_pred, '--', label=f'LOO  RMSE={loo_rmse:.4f}')
 
       ax.set_title(label)
@@ -237,6 +245,16 @@ def main():
     fig.savefig(args.plot)
     plt.close(fig)
     print(f'Plot saved to {args.plot}', file=sys.stderr)
+
+  return result
+
+
+def main():
+  args = parse_args()
+  with open(args.model) as f:
+    spec = json.load(f)
+
+  result = _fit(args, spec)
 
   output = json.dumps(result, indent=2)
   if args.output is None:

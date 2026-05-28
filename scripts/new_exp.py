@@ -2,24 +2,24 @@
 CLI script for proposing new informative experiments using Fisher D-optimality.
 
 Usage:
-  python scripts/new_exp.py --model MODEL_SPEC.json --conditions CONDITIONS.json --data MEASUREMENTS.json --parameters PARAMETERS.json --condition-ranges CONDITION_RANGES.json [options]
+  python scripts/new_exp.py --model MODEL_SPEC.json --history BATCH.json [BATCH.json ...] --parameters PARAMETERS.json --condition-ranges CONDITION_RANGES.json [options]
 
 Example:
   python scripts/new_exp.py \
     --model data/secret/simple.json \
-    --conditions data/experiments/example.json \
-    --data data/experiments/measurements.json \
+    --history store/batches/batch-1.json store/batches/batch-2.json \
     --parameters fitted.json \
     --condition-ranges ranges.json \
     --n 3 --iterations 64 --seed 0
 
+Reads batch files directly (see doe.dataset); historical conditions and the
+observable's timestamps are merged by `<batch-name>/<exp>` (batch name = file stem).
+
 Arguments:
   --model             Path to JSON file defining the CustomODESystem spec.
-  --conditions        Path to JSON file with historical experimental conditions
-                      (dict: label -> {A, B, E, temperature}).
-  --data              Path to JSON file with historical measurements
-                      (dict: label -> {timestamps: [...], measurements: [...]}).
-                      Only timestamps are used by this script.
+  --history           One or more historical batch JSON files. Conditions and the
+                      observable's timestamps are used (measured values only matter
+                      when fitting parameters from history, i.e. no --parameters).
   --parameters        Path to JSON with fitted parameter values.
                       Accepted forms:
                         {"q": ..., "K_A": ..., "K_B": ...}
@@ -51,6 +51,7 @@ import jax.numpy as jnp
 
 from doe.common import Conditions
 from doe.common.custom import CustomODESystem
+from doe.dataset import assemble
 from doe.doe import Fisher
 from doe.inference import maximum_likelihood_estimate
 
@@ -59,12 +60,10 @@ def parse_args():
   p = argparse.ArgumentParser(description='Propose informative experiments with Fisher optimal design.')
   p.add_argument('--model', required=True, metavar='FILE',
                  help='JSON file with the CustomODESystem spec.')
-  p.add_argument('--conditions', required=False, default=None, metavar='FILE',
-                 help='JSON file with historical experimental conditions.')
-  p.add_argument('--data', required=False, default=None, metavar='FILE',
-                 help='JSON file with historical measurements (timestamps are used).')
-  p.add_argument('--parameters', required=False, default=None, metavar='FILE',
-                 help='JSON file with fitted parameter values.')
+  p.add_argument('--parameters', required=True, metavar='FILE',
+                 help='JSON file with fitted parameter values {name: value}.')
+  p.add_argument('--history', required=False, default=None, nargs='+', metavar='FILE',
+                 help='Historical batch JSON files; conditions + timestamps are used.')
   p.add_argument('--n', type=int, default=None, metavar='N',
                  help='Number of new experiments to propose (default: config value).')
   p.add_argument('--iterations', type=int, default=64, metavar='N',
@@ -134,6 +133,22 @@ def _load_parameters(path, model):
     for name in expected
   }
   return model.Parameters(**values)
+
+
+def _parameters_from_fitted(ref, payload, model):
+  if not isinstance(payload, dict):
+    _fail(f'fitted_model {ref!r} has no parameters object')
+  expected = list(model.parameters.keys())
+  missing = sorted(set(expected) - set(payload))
+  extra = sorted(set(payload) - set(expected))
+  if missing:
+    _fail(f'fitted_model {ref!r} is missing parameters: {missing}')
+  if extra:
+    _fail(f'fitted_model {ref!r} has unexpected parameters: {extra}')
+  return model.Parameters(**{
+    name: _validate_finite(payload[name], f'parameters.{name}')
+    for name in expected
+  })
 
 
 def _extract_history(conditions, data):
@@ -263,6 +278,82 @@ def _plot_summary(path, loss_trace, proposals, ranges, expected, timestamps):
   plt.close(fig)
 
 
+def _build_proposal(args, spec, config, n_batch, device):
+  # Store-free: spec + parameters come from files; history gives the existing experiments
+  # (conditions + the observable's timestamps) to condition the Fisher design on.
+  observable = next(iter(spec['observables']))
+
+  if not args.history:
+    history_conditions, history_timestamps = [], []
+  else:
+    dataset = assemble(args.history)
+    data = dataset.series(observable)
+    if not data:
+      _fail(f'no historical experiment measures observable {observable!r}')
+    all_conditions = dataset.conditions()
+    conditions = {label: all_conditions[label] for label in data}
+    _, history_conditions, history_timestamps = _extract_history(conditions, data)
+
+  model = CustomODESystem(spec, device=device)
+  parameter_ranges = model.parameter_ranges()
+  parameters = _load_parameters(args.parameters, model)
+  _validate_parameters_in_ranges(parameters, parameter_ranges)
+
+  condition_ranges = Conditions(**{
+    name: config['conditions'][name]
+    for name in Conditions._fields
+  })
+
+  T = config['experiment']['duration']
+  n = config['experiment']['measurements']
+  proposal_timestamps = np.linspace(0, T, num=n + 2)[1:-1]
+
+  fisher = Fisher(
+    model,
+    condition_ranges=condition_ranges,
+    parameter_ranges=parameter_ranges,
+    timestamps=jnp.array(proposal_timestamps, dtype=jnp.float32),
+    iterations=args.iterations,
+    regularization=args.regularization,
+    criterion=args.criterion,
+  )
+
+  loss_trace, proposal = fisher.propose(
+    key=jax.random.PRNGKey(args.seed),
+    n=n_batch,
+    controls=history_conditions,
+    timestamps=history_timestamps,
+    parameters=parameters,
+  )
+
+  expected = [
+    [float(y) for y in model.solve(jax.tree.map(lambda x: x[i], proposal), proposal_timestamps, parameters)]
+    for i in range(n_batch)
+  ]
+  proposals = [
+    {name: float(getattr(jax.tree.map(lambda x: x[i], proposal), name)) for name in Conditions._fields}
+    for i in range(n_batch)
+  ]
+
+  # The script owns the design record body (experiments + the model's expected output in
+  # auxiliary, keyed by observable); the MCP layer dumps this and stamps linkage refs
+  # (source, and re-keys auxiliary.expected by the fitted_model it proposed from).
+  timestamps = [float(t) for t in proposal_timestamps]
+  experiments, expected_by_exp = {}, {}
+  for i in range(n_batch):
+    label = f'exp-{i + 1}'
+    experiments[label] = {'conditions': proposals[i]}
+    expected_by_exp[label] = {'timestamps': timestamps, observable: expected[i]}
+  result = {
+    'experiments': experiments,
+    'auxiliary': {'expected': expected_by_exp},
+  }
+  if args.plot:
+    _plot_summary(args.plot, loss_trace, proposals, condition_ranges, expected, proposal_timestamps)
+    print(f'Plot saved to {args.plot}', file=sys.stderr)
+  return result
+
+
 def main():
   args = parse_args()
 
@@ -275,11 +366,7 @@ def main():
     import yaml
     config = yaml.safe_load(f)
 
-  if args.n is None:
-    n_batch = config['experiment']['batch']
-  else:
-    n_batch = args.n
-
+  n_batch = config['experiment']['batch'] if args.n is None else args.n
   if n_batch < 1:
     _fail('--n must be >= 1')
   if args.iterations < 1:
@@ -288,104 +375,10 @@ def main():
     _fail('--regularization must be >= 0 when provided')
 
   device, *_ = jax.devices(args.device)
+  with open(args.model) as f:
+    spec = json.load(f)
 
-  spec = _load_json(args.model, 'model')
-
-  if args.conditions is None:
-    assert args.data is None, 'conditions and data must be None simultaneously'
-    conditions, data = {}, {}
-    labels, history_conditions, history_timestamps = [], [], []
-  else:
-    assert args.data is not None, 'data file must provided with condition file'
-
-    conditions = _load_json(args.conditions, 'conditions')
-    data = _load_json(args.data, 'data')
-    labels, history_conditions, history_timestamps = _extract_history(conditions, data)
-
-  model = CustomODESystem(spec, device=device)
-  parameter_ranges = model.parameter_ranges()
-  if args.parameters is None:
-    if len(data) > 0:
-      print('Parameters are not provided, fitting')
-      _, parameters, _ = maximum_likelihood_estimate(
-        model, conditions, data, model.parameter_ranges(),
-        mode='auto', iterations=None, rtol=1.0e-3
-      )
-    else:
-      print('Parameters are not provided, data is not provided, assuming center of the ranges')
-      parameters = model.Parameters(*(
-        (low + high) / 2 for low, high in model.parameter_ranges()
-      ))
-  else:
-    parameters = _load_parameters(args.parameters, model)
-  _validate_parameters_in_ranges(parameters, parameter_ranges)
-
-  condition_ranges = Conditions(**{
-    name: config['conditions'][name]
-    for name in Conditions._fields
-  })
-
-  T = config['experiment']['duration']
-  n = config['experiment']['measurements']
-  proposal_timestamps = np.linspace(0, T, num=n + 2)[1:-1]
-
-  dtype = jnp.float32
-  fisher = Fisher(
-    model,
-    condition_ranges=condition_ranges,
-    parameter_ranges=parameter_ranges,
-    timestamps=jnp.array(proposal_timestamps, dtype=dtype),
-    iterations=args.iterations,
-    regularization=args.regularization,
-    criterion=args.criterion,
-  )
-
-  key = jax.random.PRNGKey(args.seed)
-
-  loss_trace, proposal = fisher.propose(
-    key=key,
-    n=n_batch,
-    controls=history_conditions,
-    timestamps=history_timestamps,
-    parameters=parameters,
-  )
-
-  expected = [
-    model.solve(jax.tree.map(lambda x: x[i], proposal), proposal_timestamps, parameters)
-    for i in range(n_batch)
-  ]
-  expected = [[float(y) for y in ys] for ys in expected]
-
-  proposals = []
-  for i in range(n_batch):
-    cs = jax.tree.map(lambda x: x[i], proposal)
-    as_dict = {
-      name: float(getattr(cs, name))
-      for name in Conditions._fields
-    }
-    proposals.append(as_dict)
-
-  result = {
-    'criterion': args.criterion,
-    'seed': args.seed,
-    'iterations': args.iterations,
-    'n_proposals': n_batch,
-    'proposal_timestamps': [float(t) for t in proposal_timestamps],
-    'parameters': {
-      name: float(getattr(parameters, name))
-      for name in model.parameters
-    },
-    'condition_ranges': {
-      name: [float(v) for v in getattr(condition_ranges, name)]
-      for name in Conditions._fields
-    },
-    'proposals': proposals,
-    'expected': expected
-  }
-
-  if args.plot:
-    _plot_summary(args.plot, loss_trace, proposals, condition_ranges, expected, proposal_timestamps)
-    print(f'Plot saved to {args.plot}', file=sys.stderr)
+  result = _build_proposal(args, spec, config, n_batch, device)
 
   output = json.dumps(result, indent=2)
   if args.output is None:

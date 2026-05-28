@@ -8,7 +8,7 @@ from doe.store import (  # noqa: F401
     CREATABLE,
     DEFAULT_PREFIX,
     LINK_FIELDS,
-    TYPE_DIR,
+    TYPES,
     Store,
     StoreError,
     view,
